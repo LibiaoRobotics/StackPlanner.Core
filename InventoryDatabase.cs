@@ -68,8 +68,7 @@ internal sealed class InventoryDatabase
         if (string.IsNullOrWhiteSpace(boxNumber))
             return false;
 
-        if (!double.IsFinite(record.LengthMm) || !double.IsFinite(record.HeightMm) || !double.IsFinite(record.DepthMm)
-            || record.LengthMm <= 0 || record.HeightMm <= 0 || record.DepthMm <= 0)
+        if (!double.IsFinite(record.LengthMm) || !double.IsFinite(record.HeightMm) || !double.IsFinite(record.DepthMm))
             return false;
 
         if (!double.IsFinite(record.WeightKg))

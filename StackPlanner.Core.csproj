@@ -7,4 +7,10 @@
     <AssemblyName>StackPlanner.Core</AssemblyName>
     <RootNamespace>StackPlanner.Core</RootNamespace>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Update="stackplanner.config">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
 </Project>

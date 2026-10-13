@@ -144,12 +144,16 @@ public sealed class StackPlanner
 
     /// <summary>
     /// 对库存箱子进行箱型分类。
-    /// 可选对单箱三边先做降序归一化，再按三维容差比较。
+    /// 分类定义来自本地 stackplanner.config，尺寸比较固定使用 ±30mm。
     /// </summary>
-    public BoxTypeClassificationResult ClassifyInventoryBoxTypes(
-        double toleranceMm = 20,
-        bool normalizeDimensions = true)
-        => BoxTypeClassifier.Classify(_inventoryDatabase.GetAll(), toleranceMm, normalizeDimensions);
+    public BoxTypeClassificationResult ClassifyInventoryBoxTypes(double toleranceMm = 30)
+        => BoxTypeClassifier.Classify(_inventoryDatabase.GetAll(), toleranceMm);
+
+    /// <summary>
+    /// 获取 Core 配置中的全部箱型定义（来自 stackplanner.config），界面以此作为最佳策略箱型的唯一来源。
+    /// </summary>
+    public IReadOnlyList<BoxTypeDefinition> GetBoxTypeDefinitions()
+        => BoxTypeClassifier.GetDefinitions();
 
     /// <summary>获取最近一次规划结果的副本。</summary>
     public StackPlanResult CurrentPlan => ClonePlan(_lastPlan);

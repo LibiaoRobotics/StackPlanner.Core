@@ -225,6 +225,19 @@ public sealed class InventoryUpsertResult
     public required string Message { get; init; }
 }
 
+/// <summary>Core 配置中的一个箱型定义（来自 stackplanner.config）。</summary>
+public sealed class BoxTypeDefinition
+{
+    /// <summary>箱型编号。</summary>
+    public required string TypeId { get; init; }
+    /// <summary>代表长度，单位为 mm。</summary>
+    public required double RepLengthMm { get; init; }
+    /// <summary>代表高度，单位为 mm。</summary>
+    public required double RepHeightMm { get; init; }
+    /// <summary>代表宽度（depth），单位为 mm。</summary>
+    public required double RepDepthMm { get; init; }
+}
+
 /// <summary>一个箱型分类簇的摘要。</summary>
 public sealed class BoxTypeClusterSummary
 {
@@ -246,6 +259,31 @@ public sealed class BoxTypeClusterSummary
     public required double WeightMaxKg { get; init; }
 }
 
+/// <summary>单个库存箱子的分类结果。</summary>
+public sealed class BoxTypeAssignment
+{
+    /// <summary>箱子的唯一业务编号。</summary>
+    public required string BoxNumber { get; init; }
+    /// <summary>分类后的类别编号。</summary>
+    public required string TypeId { get; init; }
+    /// <summary>原始长度，单位为 mm。</summary>
+    public required double LengthMm { get; init; }
+    /// <summary>原始高度，单位为 mm。</summary>
+    public required double HeightMm { get; init; }
+    /// <summary>原始宽度（depth），单位为 mm。</summary>
+    public required double DepthMm { get; init; }
+    /// <summary>原始重量，单位为 kg。</summary>
+    public required double WeightKg { get; init; }
+    /// <summary>归类基准长度，单位为 mm；未匹配配置类别时为空。</summary>
+    public double? BaseLengthMm { get; init; }
+    /// <summary>归类基准高度，单位为 mm；未匹配配置类别时为空。</summary>
+    public double? BaseHeightMm { get; init; }
+    /// <summary>归类基准宽度（depth），单位为 mm；未匹配配置类别时为空。</summary>
+    public double? BaseDepthMm { get; init; }
+    /// <summary>数据来源标识，如 RackBox。</summary>
+    public string Source { get; init; } = string.Empty;
+}
+
 /// <summary>库存箱型分类结果。</summary>
 public sealed class BoxTypeClassificationResult
 {
@@ -257,6 +295,8 @@ public sealed class BoxTypeClassificationResult
     public required int ClusterCount { get; init; }
     /// <summary>分类簇明细。</summary>
     public required IReadOnlyList<BoxTypeClusterSummary> Clusters { get; init; }
+    /// <summary>每个箱子的分类明细。</summary>
+    public required IReadOnlyList<BoxTypeAssignment> Assignments { get; init; }
     /// <summary>结果生成时间（UTC）。</summary>
     public required DateTimeOffset GeneratedAtUtc { get; init; }
 }
