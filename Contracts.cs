@@ -185,3 +185,78 @@ public sealed class UtilizationPlanResult
     /// <summary>规划失败时的中文原因；成功时为空字符串。</summary>
     public string Message { get; init; } = string.Empty;
 }
+
+/// <summary>
+/// 待堆垛库存中的单箱记录。
+/// 尺寸语义固定为 length/height/depth，对应长/高/宽（单位均为 mm）。
+/// </summary>
+public sealed record InventoryBoxRecord
+{
+    /// <summary>箱子的唯一业务编号。</summary>
+    public required string BoxNumber { get; init; }
+    /// <summary>箱子长度，单位为 mm。</summary>
+    public required double LengthMm { get; init; }
+    /// <summary>箱子高度，单位为 mm。</summary>
+    public required double HeightMm { get; init; }
+    /// <summary>箱子宽度（depth），单位为 mm。</summary>
+    public required double DepthMm { get; init; }
+    /// <summary>箱子重量，单位为 kg。</summary>
+    public required double WeightKg { get; init; }
+    /// <summary>数据来源标识，如 RackBox。</summary>
+    public string Source { get; init; } = string.Empty;
+    /// <summary>该记录最近一次被写入库存数据库的时间（UTC）。</summary>
+    public DateTimeOffset UpdatedAtUtc { get; init; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>库存写入结果。</summary>
+public sealed class InventoryUpsertResult
+{
+    /// <summary>本次成功写入（新增+更新）的数量。</summary>
+    public required int Upserted { get; init; }
+    /// <summary>本次新增数量。</summary>
+    public required int Inserted { get; init; }
+    /// <summary>本次更新数量。</summary>
+    public required int Updated { get; init; }
+    /// <summary>本次无效记录数量。</summary>
+    public required int Invalid { get; init; }
+    /// <summary>库存中当前有效总数。</summary>
+    public required int Total { get; init; }
+    /// <summary>操作说明。</summary>
+    public required string Message { get; init; }
+}
+
+/// <summary>一个箱型分类簇的摘要。</summary>
+public sealed class BoxTypeClusterSummary
+{
+    /// <summary>类别编号。</summary>
+    public required string TypeId { get; init; }
+    /// <summary>该类别内箱子数量。</summary>
+    public required int Count { get; init; }
+    /// <summary>代表长度，单位为 mm。</summary>
+    public required double RepLengthMm { get; init; }
+    /// <summary>代表高度，单位为 mm。</summary>
+    public required double RepHeightMm { get; init; }
+    /// <summary>代表宽度（depth），单位为 mm。</summary>
+    public required double RepDepthMm { get; init; }
+    /// <summary>该类别平均重量，单位为 kg。</summary>
+    public required double WeightAvgKg { get; init; }
+    /// <summary>该类别最小重量，单位为 kg。</summary>
+    public required double WeightMinKg { get; init; }
+    /// <summary>该类别最大重量，单位为 kg。</summary>
+    public required double WeightMaxKg { get; init; }
+}
+
+/// <summary>库存箱型分类结果。</summary>
+public sealed class BoxTypeClassificationResult
+{
+    /// <summary>分类容差，单位为 mm。</summary>
+    public required double ToleranceMm { get; init; }
+    /// <summary>参与分类的箱子总数。</summary>
+    public required int TotalBoxes { get; init; }
+    /// <summary>分类簇数量。</summary>
+    public required int ClusterCount { get; init; }
+    /// <summary>分类簇明细。</summary>
+    public required IReadOnlyList<BoxTypeClusterSummary> Clusters { get; init; }
+    /// <summary>结果生成时间（UTC）。</summary>
+    public required DateTimeOffset GeneratedAtUtc { get; init; }
+}

@@ -45,6 +45,8 @@ public sealed class StackPlanner
     private readonly Dictionary<string, HashSet<string>> _pendingReplacementBoxes = new(StringComparer.Ordinal);
     /// <summary>删除后保留的、可供同规格新箱复用的规划位置。</summary>
     private readonly Dictionary<string, List<BoxPlacement>> _reusableUtilizationPlacements = new(StringComparer.Ordinal);
+    /// <summary>待堆垛库存数据库（与当前规划箱集合解耦）。</summary>
+    private readonly InventoryDatabase _inventoryDatabase = new();
     /// <summary>对外返回的最近一次规划结果。</summary>
     private StackPlanResult _lastPlan = new() { Placements = Array.Empty<BoxPlacement>(), PlanningResult = true };
 
@@ -124,6 +126,30 @@ public sealed class StackPlanner
     /// 获取当前箱子集合的副本。调用方修改返回对象不会影响 DLL 内部状态。
     /// </summary>
     public IReadOnlyList<Box> GetBoxes() => _group.Boxes.Select(CloneBox).ToArray();
+
+    /// <summary>获取当前待堆垛库存记录副本。</summary>
+    public IReadOnlyList<InventoryBoxRecord> GetInventoryBoxes() => _inventoryDatabase.GetAll();
+
+    /// <summary>
+    /// 批量写入待堆垛库存。
+    /// replaceAll=true 时先清空库存，再写入本次数据。
+    /// </summary>
+    public InventoryUpsertResult UpsertInventoryBoxes(
+        IEnumerable<InventoryBoxRecord> boxes,
+        bool replaceAll = false)
+        => _inventoryDatabase.Upsert(boxes, replaceAll);
+
+    /// <summary>清空待堆垛库存。</summary>
+    public void ClearInventoryBoxes() => _inventoryDatabase.Clear();
+
+    /// <summary>
+    /// 对库存箱子进行箱型分类。
+    /// 可选对单箱三边先做降序归一化，再按三维容差比较。
+    /// </summary>
+    public BoxTypeClassificationResult ClassifyInventoryBoxTypes(
+        double toleranceMm = 20,
+        bool normalizeDimensions = true)
+        => BoxTypeClassifier.Classify(_inventoryDatabase.GetAll(), toleranceMm, normalizeDimensions);
 
     /// <summary>获取最近一次规划结果的副本。</summary>
     public StackPlanResult CurrentPlan => ClonePlan(_lastPlan);
