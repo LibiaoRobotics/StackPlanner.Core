@@ -158,6 +158,65 @@ public sealed class StackPlanner
     /// <summary>获取最近一次规划结果的副本。</summary>
     public StackPlanResult CurrentPlan => ClonePlan(_lastPlan);
 
+    /// <summary>
+    /// 获取逐箱明细视图，包含堆垛顺序、类别、尺寸、重量、状态和规划字段。
+    /// 所有字段均由 Core 输出，供 DLL 消费方直接使用。
+    /// </summary>
+    public PlannerBoxDetailResult GetPlannerBoxDetails(double toleranceMm = 30)
+    {
+        if (!double.IsFinite(toleranceMm) || toleranceMm < 0)
+            throw new ArgumentOutOfRangeException(nameof(toleranceMm), "容差参数必须是大于等于 0 的有限数值。");
+
+        var placementsByNumber = _lastPlan.Placements
+            .GroupBy(item => item.BoxNumber, StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => group.OrderBy(item => item.Order).First(),
+                StringComparer.Ordinal);
+
+        var details = _group.Boxes
+            .Select(box =>
+            {
+                placementsByNumber.TryGetValue(box.BoxNumber, out var placement);
+                string typeId = BoxTypeClassifier.ClassifyPlanBoxTypeId(
+                    box.LengthMm,
+                    box.WidthMm,
+                    box.HeightMm,
+                    toleranceMm);
+
+                return new PlannerBoxDetail
+                {
+                    Order = placement?.Order ?? box.Order,
+                    BoxNumber = box.BoxNumber,
+                    TypeId = typeId,
+                    LengthMm = box.LengthMm,
+                    WidthMm = box.WidthMm,
+                    HeightMm = box.HeightMm,
+                    WeightKg = box.WeightKg,
+                    Status = box.Status,
+                    Planned = placement is not null,
+                    Xmm = placement?.Xmm,
+                    Ymm = placement?.Ymm,
+                    Zmm = placement?.Zmm,
+                    OrientationDeg = placement?.OrientationDeg,
+                    LayerIndex = placement?.LayerIndex,
+                };
+            })
+            .OrderBy(item => item.Order)
+            .ThenBy(item => item.BoxNumber, StringComparer.Ordinal)
+            .ToArray();
+
+        return new PlannerBoxDetailResult
+        {
+            ToleranceMm = toleranceMm,
+            PlanningResult = _lastPlan.PlanningResult,
+            TotalBoxes = _group.Boxes.Count,
+            PlannedBoxes = placementsByNumber.Count,
+            Boxes = details,
+            GeneratedAtUtc = DateTimeOffset.UtcNow,
+        };
+    }
+
     /// <summary>生成当前箱子集合和规划数据的不可变快照。</summary>
     public PlannerSnapshot CreateSnapshot() => new()
     {
@@ -806,6 +865,7 @@ public sealed class StackPlanner
     /// <remarks>
     /// 利用率规划面向“当前仍在货架上的箱子集合”。调用方应在规划前完成箱子的增删；
     /// 每个真实箱子最多使用一次，输出中的箱号和 Order 与当前集合保持对应。
+    /// 二维排布阶段使用箱型类别代表尺寸，而不是单箱原始尺寸。
     /// </remarks>
     public StackPlanResult GenerateBestUtilizationPlan()
     {
@@ -828,27 +888,28 @@ public sealed class StackPlanner
             return ClonePlan(_lastPlan);
         }
 
-        var remaining = boxes.ToList();
+        var planBoxes = BuildUtilizationPlanBoxes(boxes);
+        var remaining = planBoxes.ToList();
         var placements = new List<BoxPlacement>();
         double baseZ = 0;
         int layerIndex = 0;
         while (remaining.Count > 0)
         {
             var layerCandidates = new List<DirectBoxLayerResult>();
-            foreach (var heightGroup in remaining.GroupBy(x => x.HeightMm).OrderBy(x => x.Key))
+            foreach (var heightGroup in remaining.GroupBy(x => x.PlanHeightMm).OrderBy(x => x.Key))
             {
                 if (baseZ + heightGroup.Key > StackMaxHeightMm + Epsilon)
                     continue;
 
                 var typeKeys = heightGroup
-                    .Select(BoxTypeKey)
+                    .Select(x => x.TypeKey)
                     .Distinct(StringComparer.Ordinal)
                     .OrderBy(x => x, StringComparer.Ordinal)
                     .ToArray();
                 foreach (var combination in TypeCombinations(typeKeys, 3))
                 {
                     var candidate = FindBestFiniteDirectLayer(
-                        remaining.Where(x => combination.Contains(BoxTypeKey(x), StringComparer.Ordinal)).ToArray(),
+                        remaining.Where(x => combination.Contains(x.TypeKey, StringComparer.Ordinal)).ToArray(),
                         heightGroup.Key,
                         combination.ToHashSet(StringComparer.Ordinal));
                     if (candidate is not null)
@@ -870,20 +931,20 @@ public sealed class StackPlanner
             {
                 placements.Add(new BoxPlacement
                 {
-                    Order = item.Box.Order,
-                    BoxNumber = item.Box.BoxNumber,
+                    Order = item.Box.Source.Order,
+                    BoxNumber = item.Box.Source.BoxNumber,
                     Xmm = Round(item.Xmm),
                     Ymm = Round(item.Ymm),
-                    Zmm = Round(PlaceFloorZMm - baseZ - item.Box.HeightMm),
+                    Zmm = Round(PlaceFloorZMm - baseZ - item.Box.PlanHeightMm),
                     OrientationDeg = item.OrientationDeg,
                     LayerIndex = layerIndex,
                 });
             }
 
             var usedNumbers = selected.Placements
-                .Select(x => x.Box.BoxNumber)
+                .Select(x => x.Box.Source.BoxNumber)
                 .ToHashSet(StringComparer.Ordinal);
-            remaining.RemoveAll(x => usedNumbers.Contains(x.BoxNumber));
+            remaining.RemoveAll(x => usedNumbers.Contains(x.Source.BoxNumber));
             baseZ += selected.HeightMm;
             layerIndex++;
         }
@@ -910,8 +971,50 @@ public sealed class StackPlanner
         return ClonePlan(_lastPlan);
     }
 
+    private static IReadOnlyList<UtilizationPlanBox> BuildUtilizationPlanBoxes(
+        IReadOnlyList<Box> boxes)
+    {
+        var definitionsByTypeId = BoxTypeClassifier.GetDefinitions()
+            .ToDictionary(item => item.TypeId, item => item, StringComparer.Ordinal);
+
+        var result = new List<UtilizationPlanBox>(boxes.Count);
+        foreach (var box in boxes)
+        {
+            string typeId = BoxTypeClassifier.ClassifyPlanBoxTypeId(
+                box.LengthMm,
+                box.WidthMm,
+                box.HeightMm);
+            double lengthMm = box.LengthMm;
+            double widthMm = box.WidthMm;
+            double heightMm = box.HeightMm;
+
+            if (definitionsByTypeId.TryGetValue(typeId, out var definition))
+            {
+                // 配置语义：Length=RepLength，Width=RepDepth，Height=RepHeight。
+                lengthMm = definition.RepLengthMm;
+                widthMm = definition.RepDepthMm;
+                heightMm = definition.RepHeightMm;
+            }
+
+            result.Add(new UtilizationPlanBox(
+                Source: box,
+                TypeId: typeId,
+                PlanLengthMm: lengthMm,
+                PlanWidthMm: widthMm,
+                PlanHeightMm: heightMm,
+                TypeKey: DimensionKey(new BoxDimension
+                {
+                    LengthMm = lengthMm,
+                    WidthMm = widthMm,
+                    HeightMm = heightMm,
+                })));
+        }
+
+        return result;
+    }
+
     private DirectBoxLayerResult? FindBestFiniteDirectLayer(
-        IReadOnlyList<Box> boxes,
+        IReadOnlyList<UtilizationPlanBox> boxes,
         double heightMm,
         IReadOnlySet<string> allowedTypeKeys)
     {
@@ -926,17 +1029,17 @@ public sealed class StackPlanner
             foreach (var state in frontier)
             {
                 var representatives = state.Remaining
-                    .Where(x => allowedTypeKeys.Contains(BoxTypeKey(x)))
-                    .GroupBy(BoxTypeKey, StringComparer.Ordinal)
-                    .Select(group => group.OrderBy(x => x.Order).ThenBy(x => x.BoxNumber, StringComparer.Ordinal).First())
-                    .OrderBy(x => BoxTypeKey(x), StringComparer.Ordinal)
+                    .Where(x => allowedTypeKeys.Contains(x.TypeKey))
+                    .GroupBy(x => x.TypeKey, StringComparer.Ordinal)
+                    .Select(group => group.OrderBy(x => x.Source.Order).ThenBy(x => x.Source.BoxNumber, StringComparer.Ordinal).First())
+                    .OrderBy(x => x.TypeKey, StringComparer.Ordinal)
                     .ToArray();
                 foreach (var candidate in GenerateFiniteDirectCandidates(representatives, state.Placements))
                 {
                     if (state.Placements.Any(x => DirectBoxCollides(candidate, x)))
                         continue;
                     var remaining = state.Remaining
-                        .Where(x => !string.Equals(x.BoxNumber, candidate.Box.BoxNumber, StringComparison.Ordinal))
+                        .Where(x => !string.Equals(x.Source.BoxNumber, candidate.Box.Source.BoxNumber, StringComparison.Ordinal))
                         .ToArray();
                     next.Add(new DirectBoxLayerState(
                         state.Placements.Concat(new[] { candidate }).ToArray(),
@@ -970,14 +1073,14 @@ public sealed class StackPlanner
     }
 
     private IEnumerable<DirectBoxLayerPlacement> GenerateFiniteDirectCandidates(
-        IReadOnlyList<Box> boxes,
+        IReadOnlyList<UtilizationPlanBox> boxes,
         IReadOnlyList<DirectBoxLayerPlacement> placed)
     {
         foreach (var box in boxes)
-        foreach (var orientation in box.LengthMm == box.WidthMm ? new[] { 0 } : new[] { 0, 90 })
+        foreach (var orientation in box.PlanLengthMm == box.PlanWidthMm ? new[] { 0 } : new[] { 0, 90 })
         {
-            double width = orientation == 0 ? box.WidthMm : box.LengthMm;
-            double length = orientation == 0 ? box.LengthMm : box.WidthMm;
+            double width = orientation == 0 ? box.PlanWidthMm : box.PlanLengthMm;
+            double length = orientation == 0 ? box.PlanLengthMm : box.PlanWidthMm;
             var xs = new SortedSet<double> { _palletXMinMm + width / 2 };
             var ys = new SortedSet<double> { _palletYMinMm + length / 2 };
             foreach (var item in placed)
@@ -1005,7 +1108,7 @@ public sealed class StackPlanner
     private static int MissingDirectBoxTypeCount(
         DirectBoxLayerState state,
         IReadOnlySet<string> allowedTypeKeys)
-        => allowedTypeKeys.Count(type => !state.Placements.Any(x => BoxTypeKey(x.Box) == type));
+        => allowedTypeKeys.Count(type => !state.Placements.Any(x => x.Box.TypeKey == type));
 
     private static bool IsBetterFiniteDirectState(DirectBoxLayerState candidate, DirectBoxLayerState current)
         => candidate.OccupiedArea > current.OccupiedArea + Epsilon
@@ -1027,15 +1130,15 @@ public sealed class StackPlanner
 
     private static string DirectBoxSignature(DirectBoxLayerState state)
         => string.Join(";", state.Placements
-            .OrderBy(x => BoxTypeKey(x.Box), StringComparer.Ordinal)
+            .OrderBy(x => x.Box.TypeKey, StringComparer.Ordinal)
             .ThenBy(x => x.Xmm)
             .ThenBy(x => x.Ymm)
             .ThenBy(x => x.OrientationDeg)
-            .ThenBy(x => x.Box.BoxNumber, StringComparer.Ordinal)
-            .Select(x => string.Join("|", BoxTypeKey(x.Box),
+            .ThenBy(x => x.Box.Source.BoxNumber, StringComparer.Ordinal)
+            .Select(x => string.Join("|", x.Box.TypeKey,
                 x.Xmm.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
                 x.Ymm.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
-                x.OrientationDeg, x.Box.BoxNumber)));
+                x.OrientationDeg, x.Box.Source.BoxNumber)));
 
     private static bool DirectBoxCollides(DirectBoxLayerPlacement a, DirectBoxLayerPlacement b)
         => a.Left - StackBoxGapMm / 2 < b.Right + StackBoxGapMm / 2 - Epsilon
@@ -2168,9 +2271,17 @@ public sealed class StackPlanner
         IReadOnlyList<DirectLayerPlacement> Placements,
         double OccupiedArea,
         string Signature);
+    /// <summary>利用率规划内部箱子模型：保留原始箱号与顺序，尺寸使用类别代表值。</summary>
+    private sealed record UtilizationPlanBox(
+        Box Source,
+        string TypeId,
+        double PlanLengthMm,
+        double PlanWidthMm,
+        double PlanHeightMm,
+        string TypeKey);
     /// <summary>有限真实箱子的一层二维放置结果。</summary>
     private sealed record DirectBoxLayerPlacement(
-        Box Box,
+        UtilizationPlanBox Box,
         double Xmm,
         double Ymm,
         double Width,
@@ -2186,7 +2297,7 @@ public sealed class StackPlanner
     private sealed record DirectBoxLayerState(
         IReadOnlyList<DirectBoxLayerPlacement> Placements,
         double OccupiedArea,
-        IReadOnlyList<Box> Remaining);
+        IReadOnlyList<UtilizationPlanBox> Remaining);
     /// <summary>绑定真实箱子的单层二维布局候选。</summary>
     private sealed record DirectBoxLayerResult(
         double HeightMm,

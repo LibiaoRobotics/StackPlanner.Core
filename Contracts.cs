@@ -112,6 +112,61 @@ public sealed class PlannerSnapshot
     public required IReadOnlyList<ReusablePlacementSet> ReusablePlacements { get; init; }
 }
 
+/// <summary>
+/// 面向 DLL 消费方的逐箱明细视图。
+/// 字段全部由 Core 生成，不依赖调用方自行拼装。
+/// </summary>
+public sealed class PlannerBoxDetail
+{
+    /// <summary>堆垛顺序；未分配时可能为 -1。</summary>
+    public required int Order { get; init; }
+    /// <summary>唯一箱号。</summary>
+    public required string BoxNumber { get; init; }
+    /// <summary>箱型类别（TypeId）。</summary>
+    public required string TypeId { get; init; }
+    /// <summary>箱子长度，单位为 mm。</summary>
+    public required double LengthMm { get; init; }
+    /// <summary>箱子宽度，单位为 mm。</summary>
+    public required double WidthMm { get; init; }
+    /// <summary>箱子高度，单位为 mm。</summary>
+    public required double HeightMm { get; init; }
+    /// <summary>箱子重量，单位为 kg。</summary>
+    public required double WeightKg { get; init; }
+    /// <summary>箱子当前业务状态。</summary>
+    public required BoxStatus Status { get; init; }
+    /// <summary>该箱子是否已有当前规划放置点。</summary>
+    public required bool Planned { get; init; }
+    /// <summary>规划点 X，单位为 mm；未规划时为空。</summary>
+    public double? Xmm { get; init; }
+    /// <summary>规划点 Y，单位为 mm；未规划时为空。</summary>
+    public double? Ymm { get; init; }
+    /// <summary>规划点 Z，单位为 mm；未规划时为空。</summary>
+    public double? Zmm { get; init; }
+    /// <summary>规划方向（0 或 90）；未规划时为空。</summary>
+    public int? OrientationDeg { get; init; }
+    /// <summary>规划层数；未规划时为空。</summary>
+    public int? LayerIndex { get; init; }
+}
+
+/// <summary>
+/// Core 对外提供的逐箱明细结果，用于接口联调与外部系统验证。
+/// </summary>
+public sealed class PlannerBoxDetailResult
+{
+    /// <summary>分类容差，单位为 mm。</summary>
+    public required double ToleranceMm { get; init; }
+    /// <summary>当前规划整体是否成功。</summary>
+    public required bool PlanningResult { get; init; }
+    /// <summary>当前箱子总数。</summary>
+    public required int TotalBoxes { get; init; }
+    /// <summary>当前已有规划放置点的箱子数量。</summary>
+    public required int PlannedBoxes { get; init; }
+    /// <summary>逐箱明细。</summary>
+    public required IReadOnlyList<PlannerBoxDetail> Boxes { get; init; }
+    /// <summary>结果生成时间（UTC）。</summary>
+    public required DateTimeOffset GeneratedAtUtc { get; init; }
+}
+
 /// <summary>按完整尺寸归类的可复用规划位置。</summary>
 public sealed class ReusablePlacementSet
 {

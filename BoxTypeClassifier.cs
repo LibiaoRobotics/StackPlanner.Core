@@ -24,8 +24,8 @@ internal static class BoxTypeClassifier
         double toleranceMm)
     {
         ArgumentNullException.ThrowIfNull(boxes);
-        if (!double.IsFinite(toleranceMm))
-            throw new ArgumentOutOfRangeException(nameof(toleranceMm), "容差参数必须是有限数值。");
+        if (!double.IsFinite(toleranceMm) || toleranceMm < 0)
+            throw new ArgumentOutOfRangeException(nameof(toleranceMm), "容差参数必须是大于等于 0 的有限数值。");
 
         var configuredTypes = LoadConfiguredTypes();
         var accumulators = configuredTypes
@@ -46,7 +46,7 @@ internal static class BoxTypeClassifier
                 continue;
             }
 
-            var matched = FindBestMatchedType(box, configuredTypes);
+            var matched = FindBestMatchedType(box, configuredTypes, toleranceMm);
             if (matched is null)
             {
                 unrecognized.Add(box);
@@ -76,7 +76,7 @@ internal static class BoxTypeClassifier
 
         return new BoxTypeClassificationResult
         {
-            ToleranceMm = RecognitionToleranceMm,
+            ToleranceMm = toleranceMm,
             TotalBoxes = boxes.Count,
             ClusterCount = clusters.Count,
             Clusters = clusters,
@@ -85,6 +85,34 @@ internal static class BoxTypeClassifier
                 .ToArray(),
             GeneratedAtUtc = DateTimeOffset.UtcNow,
         };
+    }
+
+    /// <summary>
+    /// 按 Core 规划箱子的尺寸返回箱型 TypeId。
+    /// 规划箱子尺寸语义：LengthMm/HeightMm/WidthMm 对应配置的 RepLengthMm/RepHeightMm/RepDepthMm。
+    /// </summary>
+    public static string ClassifyPlanBoxTypeId(
+        double lengthMm,
+        double widthMm,
+        double heightMm,
+        double toleranceMm = RecognitionToleranceMm)
+    {
+        if (!double.IsFinite(toleranceMm) || toleranceMm < 0)
+            throw new ArgumentOutOfRangeException(nameof(toleranceMm), "容差参数必须是大于等于 0 的有限数值。");
+        if (!double.IsFinite(lengthMm) || !double.IsFinite(widthMm) || !double.IsFinite(heightMm)
+            || lengthMm <= 0 || widthMm <= 0 || heightMm <= 0)
+        {
+            return InvalidTypeId;
+        }
+
+        var configuredTypes = LoadConfiguredTypes();
+        var matched = FindBestMatchedType(
+            lengthMm,
+            heightMm,
+            widthMm,
+            configuredTypes,
+            toleranceMm);
+        return matched?.TypeId ?? UnrecognizedTypeId;
     }
 
     private static BoxTypeAssignment CreateAssignment(
@@ -116,10 +144,25 @@ internal static class BoxTypeClassifier
 
     private static ConfiguredType? FindBestMatchedType(
         InventoryBoxRecord box,
-        IReadOnlyList<ConfiguredType> configuredTypes)
+        IReadOnlyList<ConfiguredType> configuredTypes,
+        double toleranceMm)
     {
         // 不做归一化：箱子 长=DepthMm、高=HeightMm、宽=LengthMm，与配置 长=RepLengthMm、高=RepHeightMm、宽=RepDepthMm 逐轴比较
-        var (boxDim1, boxDim2, boxDim3) = (box.DepthMm, box.HeightMm, box.LengthMm);
+        return FindBestMatchedType(
+            box.DepthMm,
+            box.HeightMm,
+            box.LengthMm,
+            configuredTypes,
+            toleranceMm);
+    }
+
+    private static ConfiguredType? FindBestMatchedType(
+        double boxDim1,
+        double boxDim2,
+        double boxDim3,
+        IReadOnlyList<ConfiguredType> configuredTypes,
+        double toleranceMm)
+    {
 
         ConfiguredType? best = null;
         double bestDistance = double.MaxValue;
@@ -127,9 +170,9 @@ internal static class BoxTypeClassifier
         foreach (var configuredType in configuredTypes)
         {
             var (typeDim1, typeDim2, typeDim3) = (configuredType.RepLengthMm, configuredType.RepHeightMm, configuredType.RepDepthMm);
-            if (!WithinTolerance(boxDim1, typeDim1)
-                || !WithinTolerance(boxDim2, typeDim2)
-                || !WithinTolerance(boxDim3, typeDim3))
+            if (!WithinTolerance(boxDim1, typeDim1, toleranceMm)
+                || !WithinTolerance(boxDim2, typeDim2, toleranceMm)
+                || !WithinTolerance(boxDim3, typeDim3, toleranceMm))
             {
                 continue;
             }
@@ -153,8 +196,8 @@ internal static class BoxTypeClassifier
         return best;
     }
 
-    private static bool WithinTolerance(double value, double reference)
-        => Math.Abs(value - reference) <= RecognitionToleranceMm;
+    private static bool WithinTolerance(double value, double reference, double toleranceMm)
+        => Math.Abs(value - reference) <= toleranceMm;
 
     /// <summary>返回 stackplanner.config 中全部箱型定义，供外部（如界面）读取。</summary>
     public static IReadOnlyList<BoxTypeDefinition> GetDefinitions()
