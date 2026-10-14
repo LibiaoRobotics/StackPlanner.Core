@@ -242,6 +242,28 @@ public sealed class UtilizationPlanResult
 }
 
 /// <summary>
+/// 基于库存执行最佳策略后的结果。
+/// 由 Core 直接返回，包含策略统计与是否已应用到 Core 内存。
+/// </summary>
+public sealed class BestStrategyInventoryResult
+{
+    /// <summary>空间利用率规划是否成功。</summary>
+    public required bool PlanningResult { get; init; }
+    /// <summary>结果说明；失败时为中文原因。</summary>
+    public required string Message { get; init; }
+    /// <summary>各箱型在最佳方案中的实际数量。</summary>
+    public required IReadOnlyList<BoxTypeCount> PlannedCounts { get; init; }
+    /// <summary>逐层空间利用率。</summary>
+    public required IReadOnlyList<LayerUtilizationSummary> Layers { get; init; }
+    /// <summary>整垛各层利用率的平均值。</summary>
+    public required double Utilization { get; init; }
+    /// <summary>是否已由 Core 成功将选中箱子写入当前内存快照。</summary>
+    public required bool Applied { get; init; }
+    /// <summary>本次由 Core 从库存选中的箱子数量。</summary>
+    public required int SelectedBoxCount { get; init; }
+}
+
+/// <summary>
 /// 待堆垛库存中的单箱记录。
 /// 尺寸语义固定为 length/height/depth，对应长/高/宽（单位均为 mm）。
 /// </summary>

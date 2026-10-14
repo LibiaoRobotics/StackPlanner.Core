@@ -28,6 +28,9 @@ public sealed class StackPlanner
     private const int BeamWidth = 96;
     /// <summary>单个箱子最多保留的候选位置数量。</summary>
     private const int MaxCandidatesPerBox = 64;
+    private const string UnrecognizedTypeId = "BT-UNRECOGNIZED";
+    private const string InvalidTypeId = "BT-INVALID";
+    private const double DefaultMaxSelectableWeightKg = 10d;
     private double _palletXMinMm;
     private double _palletXMaxMm;
     private double _palletYMinMm;
@@ -669,6 +672,182 @@ public sealed class StackPlanner
         };
     }
 
+    /// <summary>
+    /// 按候选箱型先计算最佳策略，再由 Core 在库存中挑选真实箱号并写入当前内存。
+    /// </summary>
+    /// <param name="dimensions">候选箱型尺寸与最小数量。</param>
+    /// <param name="maxSelectableWeightKg">库存选箱允许的最大重量（kg），默认 10kg。</param>
+    public BestStrategyInventoryResult BuildBestStrategyFromInventory(
+        IEnumerable<BoxDimension> dimensions,
+        double maxSelectableWeightKg = DefaultMaxSelectableWeightKg)
+    {
+        if (!double.IsFinite(maxSelectableWeightKg) || maxSelectableWeightKg <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxSelectableWeightKg), "最大选箱重量必须是有限正数。 ");
+
+        var utilization = PlanBestUtilization(dimensions);
+        if (!utilization.PlanningResult)
+        {
+            return new BestStrategyInventoryResult
+            {
+                PlanningResult = false,
+                Message = string.IsNullOrWhiteSpace(utilization.Message)
+                    ? "无法满足箱型最小数量约束。"
+                    : utilization.Message,
+                PlannedCounts = utilization.PlannedCounts,
+                Layers = utilization.Layers,
+                Utilization = utilization.Utilization,
+                Applied = false,
+                SelectedBoxCount = 0,
+            };
+        }
+
+        var typeByDimension = GetBoxTypeDefinitions()
+            .GroupBy(
+                item => ExactDimensionKey(item.RepLengthMm, item.RepDepthMm, item.RepHeightMm),
+                StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => group.OrderBy(item => item.TypeId, StringComparer.Ordinal).First().TypeId,
+                StringComparer.Ordinal);
+
+        var inventory = ClassifyInventoryBoxTypes();
+        var poolByType = inventory.Assignments
+            .Where(item => !string.IsNullOrWhiteSpace(item.TypeId)
+                           && !string.Equals(item.TypeId, UnrecognizedTypeId, StringComparison.Ordinal)
+                           && !string.Equals(item.TypeId, InvalidTypeId, StringComparison.Ordinal)
+                           && item.WeightKg > 0
+                           && item.WeightKg <= maxSelectableWeightKg)
+            .GroupBy(item => item.TypeId, StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => new Queue<BoxTypeAssignment>(
+                    group.OrderBy(item => item.BoxNumber, StringComparer.Ordinal)),
+                StringComparer.Ordinal);
+
+        var selectedBoxes = new List<Box>();
+        foreach (var planned in utilization.PlannedCounts.Where(item => item.Count > 0))
+        {
+            string key = ExactDimensionKey(planned.LengthMm, planned.WidthMm, planned.HeightMm);
+            if (!typeByDimension.TryGetValue(key, out var typeId))
+            {
+                return new BestStrategyInventoryResult
+                {
+                    PlanningResult = false,
+                    Message = $"策略箱型无法映射到 Core 配置：{planned.LengthMm:0}×{planned.WidthMm:0}×{planned.HeightMm:0}mm。",
+                    PlannedCounts = utilization.PlannedCounts,
+                    Layers = utilization.Layers,
+                    Utilization = utilization.Utilization,
+                    Applied = false,
+                    SelectedBoxCount = 0,
+                };
+            }
+
+            poolByType.TryGetValue(typeId, out var queue);
+            int available = queue?.Count ?? 0;
+            if (available < planned.Count)
+            {
+                return new BestStrategyInventoryResult
+                {
+                    PlanningResult = false,
+                    Message = $"Core 库存中箱型 {typeId} 可用箱子不足：需要 {planned.Count}，可用 {available}。",
+                    PlannedCounts = utilization.PlannedCounts,
+                    Layers = utilization.Layers,
+                    Utilization = utilization.Utilization,
+                    Applied = false,
+                    SelectedBoxCount = 0,
+                };
+            }
+
+            for (int i = 0; i < planned.Count; i++)
+            {
+                var picked = queue!.Dequeue();
+                // 维持既有协议：库存 depth -> 规划 length，库存 length -> 规划 width。
+                selectedBoxes.Add(new Box
+                {
+                    BoxNumber = picked.BoxNumber,
+                    LengthMm = picked.DepthMm,
+                    WidthMm = picked.LengthMm,
+                    HeightMm = picked.HeightMm,
+                    WeightKg = picked.WeightKg,
+                    Status = BoxStatus.OnShelf,
+                });
+            }
+        }
+
+        RestoreSnapshot(new PlannerSnapshot
+        {
+            Revision = 0,
+            UpdatedAtUtc = DateTimeOffset.UtcNow,
+            Boxes = selectedBoxes,
+            Plan = new StackPlanResult
+            {
+                Placements = Array.Empty<BoxPlacement>(),
+                PlanningResult = selectedBoxes.Count == 0,
+            },
+            ReusablePlacements = Array.Empty<ReusablePlacementSet>(),
+        });
+
+        return new BestStrategyInventoryResult
+        {
+            PlanningResult = true,
+            Message = $"Core 已按最佳策略从库存选择 {selectedBoxes.Count} 个箱子。",
+            PlannedCounts = utilization.PlannedCounts,
+            Layers = utilization.Layers,
+            Utilization = utilization.Utilization,
+            Applied = true,
+            SelectedBoxCount = selectedBoxes.Count,
+        };
+    }
+
+    /// <summary>
+    /// 用给定的真实箱子集合重建 Core 内存并执行有限箱子利用率规划。
+    /// </summary>
+    public StackPlanResult GenerateBestUtilizationPlanFromBoxes(IEnumerable<Box> boxes)
+    {
+        ArgumentNullException.ThrowIfNull(boxes);
+        ClearBoxes();
+        AddBoxes(boxes);
+        return GenerateBestUtilizationPlan();
+    }
+
+    /// <summary>
+    /// 在给定快照上应用利用率加减箱变更，并返回最终结果。
+    /// </summary>
+    public UtilizationMutationResult ApplyUtilizationMutation(
+        PlannerSnapshot snapshot,
+        IEnumerable<string> removedBoxNumbers,
+        IEnumerable<Box> addedBoxes)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        ArgumentNullException.ThrowIfNull(removedBoxNumbers);
+        ArgumentNullException.ThrowIfNull(addedBoxes);
+
+        RestoreSnapshot(snapshot);
+
+        UtilizationMutationResult? result = null;
+        foreach (string boxNumber in removedBoxNumbers)
+        {
+            result = RemoveBoxWithoutReplanning(new Box
+            {
+                BoxNumber = boxNumber,
+            });
+            if (!result.Succeeded)
+                break;
+        }
+
+        if (result is null || result.Succeeded)
+        {
+            foreach (var box in addedBoxes)
+            {
+                result = AddBoxWithoutReplanning(box);
+                if (!result.Succeeded)
+                    break;
+            }
+        }
+
+        return result ?? MutationSuccess("没有需要执行的加减箱操作。");
+    }
+
     private DirectStackResult? FindBestLayerStack(
         IReadOnlyList<DirectLayerResult> candidates,
         IReadOnlyList<BoxDimension> dimensions)
@@ -1166,6 +1345,12 @@ public sealed class StackPlanner
         => string.Join("x", Math.Min(dimension.LengthMm, dimension.WidthMm).ToString("R", System.Globalization.CultureInfo.InvariantCulture),
             Math.Max(dimension.LengthMm, dimension.WidthMm).ToString("R", System.Globalization.CultureInfo.InvariantCulture),
             dimension.HeightMm.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+
+    private static string ExactDimensionKey(double lengthMm, double widthMm, double heightMm)
+        => string.Join("|",
+            lengthMm.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+            widthMm.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+            heightMm.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
 
     private StackPlanner CreatePlanningCopy()
     {
