@@ -242,10 +242,10 @@ public sealed class UtilizationPlanResult
 }
 
 /// <summary>
-/// 基于库存执行最佳策略后的结果。
+/// 基于库存的利用率规划结果。
 /// 由 Core 直接返回，包含策略统计与是否已应用到 Core 内存。
 /// </summary>
-public sealed class BestStrategyInventoryResult
+public sealed class InventoryUtilizationPlanResult
 {
     /// <summary>空间利用率规划是否成功。</summary>
     public required bool PlanningResult { get; init; }

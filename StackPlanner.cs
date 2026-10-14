@@ -586,12 +586,20 @@ public sealed class StackPlanner
     }
 
     /// <summary>
-    /// 仅根据候选尺寸生成逐层空间利用率规划。
-    /// 不接收库存数量；每种尺寸视为可无限供应。结果同时返回箱子数量和空间利用率。
+    /// 根据候选尺寸生成逐层空间利用率规划，并读取库存中各箱型的可选数量作为上限。
+    /// 每个箱型的上限 = 库存中同类别、重量在 (0, maxSelectableWeightKg] 内的箱子数量；
+    /// 库存中没有该类箱子时上限为 0，不参与规划。结果同时返回箱子数量和空间利用率。
     /// </summary>
-    public UtilizationPlanResult PlanBestUtilization(IEnumerable<BoxDimension> dimensions)
+    /// <param name="dimensions">候选箱型尺寸与最小数量。</param>
+    /// <param name="maxSelectableWeightKg">库存选箱允许的最大重量（kg），默认 10kg。</param>
+    /// <exception cref="ArgumentOutOfRangeException">maxSelectableWeightKg 不是有限正数。</exception>
+    public UtilizationPlanResult PlanBestUtilization(
+        IEnumerable<BoxDimension> dimensions,
+        double maxSelectableWeightKg = DefaultMaxSelectableWeightKg)
     {
         ArgumentNullException.ThrowIfNull(dimensions);
+        if (!double.IsFinite(maxSelectableWeightKg) || maxSelectableWeightKg <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxSelectableWeightKg), "最大选箱重量必须是有限正数。");
         var input = dimensions.ToArray();
         if (input.Length == 0)
             return EmptyUtilizationPlan("至少需要一个箱子尺寸。");
@@ -615,19 +623,47 @@ public sealed class StackPlanner
             .OrderBy(x => DimensionKey(x), StringComparer.Ordinal)
             .ToArray();
 
-        // 直接搜索真实二维布局，不再生成有限数量的临时箱子。
-        var candidates = unique
+        // 库存上限：每个候选箱型可用的真实库存数量（与选箱使用同一套筛选条件）。
+        var selectableCounts = CountSelectableInventoryByType(maxSelectableWeightKg);
+        var typeIdByShape = GetBoxTypeDefinitions()
+            .GroupBy(item => ExactDimensionKey(item.RepLengthMm, item.RepDepthMm, item.RepHeightMm), StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => group.OrderBy(item => item.TypeId, StringComparer.Ordinal).First().TypeId,
+                StringComparer.Ordinal);
+        var caps = unique.ToDictionary(
+            x => DimensionKey(x),
+            x => typeIdByShape.TryGetValue(ExactDimensionKey(x.LengthMm, x.WidthMm, x.HeightMm), out var typeId)
+                ? selectableCounts.GetValueOrDefault(typeId)
+                : 0,
+            StringComparer.Ordinal);
+
+        // 最小数量超过库存上限时直接失败，避免被误报为层堆叠无解。
+        var shortages = unique
+            .Where(x => x.MinimumCount > caps[DimensionKey(x)])
+            .Select(x => $"{x.LengthMm:0}×{x.WidthMm:0}×{x.HeightMm:0}mm 需要 {x.MinimumCount} 个，库存可选 {caps[DimensionKey(x)]} 个")
+            .ToArray();
+        if (shortages.Length > 0)
+            return EmptyUtilizationPlan("库存可选箱子不足：" + string.Join("；", shortages) + "。", false);
+
+        // 上限为 0 的箱型（库存中没有可选箱子）不参与规划。
+        var available = unique.Where(x => caps[DimensionKey(x)] > 0).ToArray();
+        if (available.Length == 0)
+            return EmptyUtilizationPlan("库存中没有可用于任何候选尺寸的可选箱子。", false);
+
+        // 直接搜索真实二维布局，不再生成有限数量的临时箱子；每层与堆叠都受库存上限约束。
+        var candidates = available
             .GroupBy(x => x.HeightMm)
             .SelectMany(group => TypeCombinations(
                 group.OrderBy(x => DimensionKey(x), StringComparer.Ordinal).ToArray(), 3))
-            .Select(FindBestDirectLayer)
+            .Select(types => FindBestDirectLayer(types, caps))
             .Where(x => x is not null)
             .Cast<DirectLayerResult>()
             .ToArray();
         if (candidates.Length == 0)
             return EmptyUtilizationPlan("没有尺寸可以形成合法布局。");
 
-        var selected = FindBestLayerStack(candidates, unique);
+        var selected = FindBestLayerStack(candidates, available, caps);
         if (selected is null)
             return EmptyUtilizationPlan("在托盘尺寸和最大堆垛高度限制下，无法满足箱型最小数量约束。", false);
 
@@ -673,21 +709,99 @@ public sealed class StackPlanner
     }
 
     /// <summary>
-    /// 按候选箱型先计算最佳策略，再由 Core 在库存中挑选真实箱号并写入当前内存。
+    /// 基于库存的利用率规划：先按候选箱型计算最佳策略，由 Core 从库存挑选真实箱号写入当前内存，
+    /// 再对选中的真实箱子执行利用率规划，规划结果保存在 Core 内存快照中。
     /// </summary>
-    /// <param name="dimensions">候选箱型尺寸与最小数量。</param>
+    /// <param name="dimensions">
+    /// 候选箱型尺寸与最小数量。
+    /// 传入 null 或空集合时，优先使用 stackplanner.config 的 defaultUtilizationDimensions；
+    /// 未配置该字段时回退到全部箱型尺寸（MinimumCount=0）。
+    /// </param>
     /// <param name="maxSelectableWeightKg">库存选箱允许的最大重量（kg），默认 10kg。</param>
-    public BestStrategyInventoryResult BuildBestStrategyFromInventory(
-        IEnumerable<BoxDimension> dimensions,
+    public InventoryUtilizationPlanResult PlanUtilizationFromInventory(
+        IEnumerable<BoxDimension>? dimensions = null,
         double maxSelectableWeightKg = DefaultMaxSelectableWeightKg)
+    {
+        var selection = SelectInventoryBoxesForUtilization(
+            ResolveInventoryUtilizationDimensions(dimensions),
+            maxSelectableWeightKg);
+        if (!selection.Applied)
+            return selection;
+
+        var plan = GenerateBestUtilizationPlan();
+        return new InventoryUtilizationPlanResult
+        {
+            PlanningResult = plan.PlanningResult,
+            Message = plan.PlanningResult
+                ? selection.Message
+                : "库存选箱已写入 Core 内存，但真实箱子利用率规划失败。",
+            PlannedCounts = selection.PlannedCounts,
+            Layers = selection.Layers,
+            Utilization = selection.Utilization,
+            Applied = true,
+            SelectedBoxCount = selection.SelectedBoxCount,
+        };
+    }
+
+    /// <summary>
+    /// 解析库存利用率规划使用的候选尺寸：调用方传参优先；未传或空集合时回退到配置箱型。
+    /// </summary>
+    private IReadOnlyList<BoxDimension> ResolveInventoryUtilizationDimensions(
+        IEnumerable<BoxDimension>? dimensions)
+    {
+        if (dimensions is not null)
+        {
+            var provided = dimensions.ToArray();
+            if (provided.Length > 0)
+                return provided;
+        }
+
+        var defaultsFromConfig = BoxTypeClassifier.GetDefaultUtilizationDimensions();
+        if (defaultsFromConfig.Count > 0)
+            return defaultsFromConfig;
+
+        return GetBoxTypeDefinitions()
+            .Select(definition => new BoxDimension
+            {
+                LengthMm = definition.RepLengthMm,
+                WidthMm = definition.RepDepthMm,
+                HeightMm = definition.RepHeightMm,
+                MinimumCount = 0,
+            })
+            .ToArray();
+    }
+
+    /// <summary>
+    /// 判断库存箱子是否可用于选箱：箱型有效，且重量在 (0, maxSelectableWeightKg] 内。
+    /// </summary>
+    private static bool IsSelectableInventoryAssignment(BoxTypeAssignment item, double maxSelectableWeightKg)
+        => !string.IsNullOrWhiteSpace(item.TypeId)
+           && !string.Equals(item.TypeId, UnrecognizedTypeId, StringComparison.Ordinal)
+           && !string.Equals(item.TypeId, InvalidTypeId, StringComparison.Ordinal)
+           && item.WeightKg > 0
+           && item.WeightKg <= maxSelectableWeightKg;
+
+    /// <summary>统计库存中各箱型的可选数量（与选箱使用同一筛选条件）。</summary>
+    private Dictionary<string, int> CountSelectableInventoryByType(double maxSelectableWeightKg)
+        => ClassifyInventoryBoxTypes().Assignments
+            .Where(item => IsSelectableInventoryAssignment(item, maxSelectableWeightKg))
+            .GroupBy(item => item.TypeId, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
+
+    /// <summary>
+    /// 按候选箱型计算最佳策略，并从库存挑选真实箱号写入当前内存（仅供 <see cref="PlanUtilizationFromInventory"/> 内部使用）。
+    /// </summary>
+    private InventoryUtilizationPlanResult SelectInventoryBoxesForUtilization(
+        IEnumerable<BoxDimension> dimensions,
+        double maxSelectableWeightKg)
     {
         if (!double.IsFinite(maxSelectableWeightKg) || maxSelectableWeightKg <= 0)
             throw new ArgumentOutOfRangeException(nameof(maxSelectableWeightKg), "最大选箱重量必须是有限正数。 ");
 
-        var utilization = PlanBestUtilization(dimensions);
+        var utilization = PlanBestUtilization(dimensions, maxSelectableWeightKg);
         if (!utilization.PlanningResult)
         {
-            return new BestStrategyInventoryResult
+            return new InventoryUtilizationPlanResult
             {
                 PlanningResult = false,
                 Message = string.IsNullOrWhiteSpace(utilization.Message)
@@ -712,11 +826,7 @@ public sealed class StackPlanner
 
         var inventory = ClassifyInventoryBoxTypes();
         var poolByType = inventory.Assignments
-            .Where(item => !string.IsNullOrWhiteSpace(item.TypeId)
-                           && !string.Equals(item.TypeId, UnrecognizedTypeId, StringComparison.Ordinal)
-                           && !string.Equals(item.TypeId, InvalidTypeId, StringComparison.Ordinal)
-                           && item.WeightKg > 0
-                           && item.WeightKg <= maxSelectableWeightKg)
+            .Where(item => IsSelectableInventoryAssignment(item, maxSelectableWeightKg))
             .GroupBy(item => item.TypeId, StringComparer.Ordinal)
             .ToDictionary(
                 group => group.Key,
@@ -730,7 +840,7 @@ public sealed class StackPlanner
             string key = ExactDimensionKey(planned.LengthMm, planned.WidthMm, planned.HeightMm);
             if (!typeByDimension.TryGetValue(key, out var typeId))
             {
-                return new BestStrategyInventoryResult
+                return new InventoryUtilizationPlanResult
                 {
                     PlanningResult = false,
                     Message = $"策略箱型无法映射到 Core 配置：{planned.LengthMm:0}×{planned.WidthMm:0}×{planned.HeightMm:0}mm。",
@@ -746,7 +856,7 @@ public sealed class StackPlanner
             int available = queue?.Count ?? 0;
             if (available < planned.Count)
             {
-                return new BestStrategyInventoryResult
+                return new InventoryUtilizationPlanResult
                 {
                     PlanningResult = false,
                     Message = $"Core 库存中箱型 {typeId} 可用箱子不足：需要 {planned.Count}，可用 {available}。",
@@ -787,7 +897,7 @@ public sealed class StackPlanner
             ReusablePlacements = Array.Empty<ReusablePlacementSet>(),
         });
 
-        return new BestStrategyInventoryResult
+        return new InventoryUtilizationPlanResult
         {
             PlanningResult = true,
             Message = $"Core 已按最佳策略从库存选择 {selectedBoxes.Count} 个箱子。",
@@ -850,25 +960,29 @@ public sealed class StackPlanner
 
     private DirectStackResult? FindBestLayerStack(
         IReadOnlyList<DirectLayerResult> candidates,
-        IReadOnlyList<BoxDimension> dimensions)
+        IReadOnlyList<BoxDimension> dimensions,
+        IReadOnlyDictionary<string, int> caps)
     {
         var minimums = dimensions.Select(x => x.MinimumCount).ToArray();
+        var remainingCaps = dimensions.Select(x => caps[DimensionKey(x)]).ToArray();
         var keys = dimensions.Select(DimensionKey).ToArray();
         var memo = new Dictionary<string, DirectStackResult?>();
-        return SearchLayerStack(candidates, StackMaxHeightMm, minimums, keys, memo);
+        return SearchLayerStack(candidates, StackMaxHeightMm, minimums, remainingCaps, keys, memo);
     }
 
     private DirectStackResult? SearchLayerStack(
         IReadOnlyList<DirectLayerResult> candidates,
         double remainingHeight,
         IReadOnlyList<int> remainingMinimums,
+        IReadOnlyList<int> remainingCaps,
         IReadOnlyList<string> dimensionKeys,
         IDictionary<string, DirectStackResult?> memo)
     {
         string key = string.Join("|",
             Math.Round(remainingHeight, 3, MidpointRounding.AwayFromZero)
                 .ToString("R", System.Globalization.CultureInfo.InvariantCulture),
-            string.Join(",", remainingMinimums));
+            string.Join(",", remainingMinimums),
+            string.Join(",", remainingCaps));
         if (memo.TryGetValue(key, out var cached)) return cached;
 
         bool requirementsMet = remainingMinimums.All(x => x <= 0);
@@ -881,18 +995,30 @@ public sealed class StackPlanner
                      .ThenBy(x => x.Signature, StringComparer.Ordinal))
         {
             var nextMinimums = remainingMinimums.ToArray();
+            var nextCaps = remainingCaps.ToArray();
+            bool withinCaps = true;
             foreach (var count in candidate.Placements
                          .GroupBy(x => DimensionKey(x.Dimension), StringComparer.Ordinal))
             {
                 int index = Array.IndexOf(dimensionKeys.ToArray(), count.Key);
-                if (index >= 0)
-                    nextMinimums[index] = Math.Max(0, nextMinimums[index] - count.Count());
+                if (index < 0) continue;
+                int used = count.Count();
+                // 库存上限：累计放置数量不能超过该箱型的剩余可选数量。
+                if (used > nextCaps[index])
+                {
+                    withinCaps = false;
+                    break;
+                }
+                nextCaps[index] -= used;
+                nextMinimums[index] = Math.Max(0, nextMinimums[index] - used);
             }
+            if (!withinCaps) continue;
 
             var tail = SearchLayerStack(
                 candidates,
                 remainingHeight - candidate.HeightMm,
                 nextMinimums,
+                nextCaps,
                 dimensionKeys,
                 memo);
             if (tail is null) continue;
@@ -917,7 +1043,9 @@ public sealed class StackPlanner
             || candidate.TotalCount == current.TotalCount
             && string.CompareOrdinal(candidate.Signature, current.Signature) < 0);
 
-    private DirectLayerResult? FindBestDirectLayer(IReadOnlyList<BoxDimension> types)
+    private DirectLayerResult? FindBestDirectLayer(
+        IReadOnlyList<BoxDimension> types,
+        IReadOnlyDictionary<string, int> caps)
     {
         if (types.Count == 0) return null;
         var frontier = new[] { new DirectLayerState(Array.Empty<DirectLayerPlacement>(), 0) };
@@ -926,12 +1054,19 @@ public sealed class StackPlanner
         {
             var next = new List<DirectLayerState>();
             foreach (var state in frontier)
-            foreach (var candidate in GenerateDirectCandidates(types, state.Placements))
             {
-                if (state.Placements.Any(x => DirectCollides(candidate, x))) continue;
-                next.Add(new DirectLayerState(
-                    state.Placements.Concat(new[] { candidate }).ToArray(),
-                    state.OccupiedArea + candidate.Width * candidate.Length));
+                // 已达到库存上限的箱型不再尝试放入本层。
+                var open = types
+                    .Where(type => state.Placements.Count(x => DimensionKey(x.Dimension) == DimensionKey(type))
+                                   < caps[DimensionKey(type)])
+                    .ToArray();
+                foreach (var candidate in GenerateDirectCandidates(open, state.Placements))
+                {
+                    if (state.Placements.Any(x => DirectCollides(candidate, x))) continue;
+                    next.Add(new DirectLayerState(
+                        state.Placements.Concat(new[] { candidate }).ToArray(),
+                        state.OccupiedArea + candidate.Width * candidate.Length));
+                }
             }
 
             frontier = next
@@ -1037,7 +1172,7 @@ public sealed class StackPlanner
 
     /// <summary>
     /// 使用当前真实箱子集合执行有限数量的二维利用率规划，并直接返回逐箱堆垛数据。
-    /// 本方法复用 <see cref="PlanBestUtilization(IEnumerable{BoxDimension})" /> 的
+    /// 本方法复用 <see cref="PlanBestUtilization(IEnumerable{BoxDimension}, double)" /> 的
     /// 同高度分层、最多三种箱型组合和二维候选搜索思路，但不会调用正式的
     /// <see cref="GeneratePlan()" />，也不会重新生成箱子数量或箱号。
     /// </summary>

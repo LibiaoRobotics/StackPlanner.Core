@@ -211,12 +211,48 @@ internal static class BoxTypeClassifier
             })
             .ToArray();
 
+    /// <summary>
+    /// 返回 stackplanner.config 中配置的默认利用率候选尺寸。
+    /// 未配置时返回空数组，由上层决定回退行为。
+    /// </summary>
+    public static IReadOnlyList<BoxDimension> GetDefaultUtilizationDimensions()
+    {
+        string configPath = ResolveConfigPath();
+        using var stream = File.OpenRead(configPath);
+        var config = LoadConfigFile(configPath, stream);
+
+        if (config.DefaultUtilizationDimensions is null || config.DefaultUtilizationDimensions.Count == 0)
+            return Array.Empty<BoxDimension>();
+
+        var result = new List<BoxDimension>(config.DefaultUtilizationDimensions.Count);
+        foreach (var entry in config.DefaultUtilizationDimensions)
+        {
+            if (!IsPositiveFinite(entry.LengthMm)
+                || !IsPositiveFinite(entry.WidthMm)
+                || !IsPositiveFinite(entry.HeightMm)
+                || entry.MinimumCount < 0)
+            {
+                throw new InvalidDataException(
+                    "defaultUtilizationDimensions 的尺寸必须为有限正数，MinimumCount 不能小于 0。 ");
+            }
+
+            result.Add(new BoxDimension
+            {
+                LengthMm = entry.LengthMm,
+                WidthMm = entry.WidthMm,
+                HeightMm = entry.HeightMm,
+                MinimumCount = entry.MinimumCount,
+            });
+        }
+
+        return result;
+    }
+
     private static IReadOnlyList<ConfiguredType> LoadConfiguredTypes()
     {
         string configPath = ResolveConfigPath();
         using var stream = File.OpenRead(configPath);
-        var config = JsonSerializer.Deserialize<BoxTypeConfigFile>(stream, ConfigJsonOptions)
-            ?? throw new InvalidDataException($"无法解析箱型配置文件：{configPath}");
+        var config = LoadConfigFile(configPath, stream);
         if (config.Types is null || config.Types.Count == 0)
             throw new InvalidDataException($"箱型配置文件未包含有效的 types：{configPath}");
 
@@ -241,6 +277,10 @@ internal static class BoxTypeClassifier
 
         return result;
     }
+
+    private static BoxTypeConfigFile LoadConfigFile(string configPath, Stream stream)
+        => JsonSerializer.Deserialize<BoxTypeConfigFile>(stream, ConfigJsonOptions)
+           ?? throw new InvalidDataException($"无法解析箱型配置文件：{configPath}");
 
     private static bool IsPositiveFinite(double value) => double.IsFinite(value) && value > 0;
 
@@ -362,6 +402,8 @@ internal static class BoxTypeClassifier
     private sealed class BoxTypeConfigFile
     {
         public IReadOnlyList<BoxTypeConfigEntry> Types { get; init; } = Array.Empty<BoxTypeConfigEntry>();
+        public IReadOnlyList<DefaultUtilizationDimensionEntry> DefaultUtilizationDimensions { get; init; }
+            = Array.Empty<DefaultUtilizationDimensionEntry>();
     }
 
     private sealed class BoxTypeConfigEntry
@@ -370,5 +412,13 @@ internal static class BoxTypeClassifier
         public double RepLengthMm { get; init; }
         public double RepHeightMm { get; init; }
         public double RepDepthMm { get; init; }
+    }
+
+    private sealed class DefaultUtilizationDimensionEntry
+    {
+        public double LengthMm { get; init; }
+        public double WidthMm { get; init; }
+        public double HeightMm { get; init; }
+        public int MinimumCount { get; init; }
     }
 }
