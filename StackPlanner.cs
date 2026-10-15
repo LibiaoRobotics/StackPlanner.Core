@@ -1051,9 +1051,7 @@ public sealed class StackPlanner
         int neededCount = 0;
         while (true)
         {
-            var candidate = GenerateCandidates(sameTypeTemplate, occupied)
-                .FirstOrDefault(x => x.Placement.LayerIndex == targetLayer
-                    && Math.Abs(x.Candidate.BaseZ - targetBaseZ) <= Epsilon);
+            var candidate = FindLayerFillSlot(sameTypeTemplate, occupied, targetLayer, targetBaseZ);
             if (candidate is null)
                 break;
 
@@ -2011,9 +2009,7 @@ public sealed class StackPlanner
                      .ThenBy(x => x.Source.BoxNumber, StringComparer.Ordinal))
         {
             var box = planBox.Source;
-            var candidate = GenerateCandidates(box, occupied)
-                .FirstOrDefault(x => x.Placement.LayerIndex == targetLayer
-                    && Math.Abs(x.Candidate.BaseZ - targetBaseZ) <= Epsilon);
+            var candidate = FindLayerFillSlot(box, occupied, targetLayer, targetBaseZ);
             if (candidate is null)
                 continue;
 
@@ -2032,7 +2028,7 @@ public sealed class StackPlanner
             "已尝试补齐成功层同型箱。",
             detail: $"SucceededTypeId={succeededTypeId}, CandidateCount={sameTypeCandidateCount}, PlacedCount={placedSucceededTypeNumbers.Count}, TargetLayer={targetLayer}, TargetBaseZ={targetBaseZ:R}");
 
-        int openSlotCount = GenerateCandidates(sameTypeTemplate, occupied)
+        int openSlotCount = GenerateAllCandidates(sameTypeTemplate, occupied)
             .Count(x => x.Placement.LayerIndex == targetLayer
                 && Math.Abs(x.Candidate.BaseZ - targetBaseZ) <= Epsilon);
         bool layerIsFull = openSlotCount == 0;
@@ -2690,9 +2686,29 @@ public sealed class StackPlanner
     }
 
     /// <summary>
-    /// 生成一个箱子的全部合法候选位置，并按固定规则排序。
+    /// 生成一个箱子的候选位置，并按固定规则排序后截断为 MaxCandidatesPerBox 个。
     /// </summary>
-    private IReadOnlyList<CandidatePlacement> GenerateCandidates(Box box, IReadOnlyList<PlacedBox> occupied)
+    private IReadOnlyList<CandidatePlacement> GenerateCandidates(Box box, IReadOnlyList<PlacedBox> occupied) =>
+        GenerateAllCandidates(box, occupied).Take(MaxCandidatesPerBox).ToArray();
+
+    /// <summary>
+    /// 在目标层与目标箱底高度上，按"先低 Y、再低 X"选择第一个合法位置。
+    /// 不受候选截断与支撑面积排序影响，使同型箱沿规则网格紧密排列，避免错位点碎化剩余空位。
+    /// </summary>
+    private CandidatePlacement? FindLayerFillSlot(Box box, IReadOnlyList<PlacedBox> occupied, int targetLayer, double targetBaseZ) =>
+        GenerateAllCandidates(box, occupied)
+            .Where(x => x.Placement.LayerIndex == targetLayer
+                && Math.Abs(x.Candidate.BaseZ - targetBaseZ) <= Epsilon)
+            .OrderBy(x => x.Placement.Ymm)
+            .ThenBy(x => x.Placement.Xmm)
+            .ThenBy(x => x.Placement.OrientationDeg)
+            .ThenBy(x => x.Placement.BoxNumber, StringComparer.Ordinal)
+            .FirstOrDefault();
+
+    /// <summary>
+    /// 生成一个箱子的全部合法候选位置（不截断），并按固定规则排序。
+    /// </summary>
+    private IReadOnlyList<CandidatePlacement> GenerateAllCandidates(Box box, IReadOnlyList<PlacedBox> occupied)
     {
         // 候选点由托盘边界和已占用箱体的边界共同产生，避免连续浮点网格搜索。
         var candidates = new List<CandidatePlacement>();
@@ -2746,7 +2762,6 @@ public sealed class StackPlanner
             .ThenBy(x => x.Placement.Xmm)
             .ThenBy(x => x.Placement.OrientationDeg)
             .ThenBy(x => x.Placement.BoxNumber, StringComparer.Ordinal)
-            .Take(MaxCandidatesPerBox)
             .ToArray();
     }
 
