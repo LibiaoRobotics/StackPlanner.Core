@@ -418,7 +418,7 @@ public sealed class StackPlanner
     /// </summary>
     /// <param name="box">待删除的箱子；仅使用其 BoxNumber 定位 Core 内部箱子。</param>
     /// <returns>删除结果，以及操作后的完整箱子集合和规划快照。</returns>
-    public UtilizationMutationResult RemoveBoxWithoutReplanning(Box box)
+    public UtilizationMutationResult RemoveAndAddSameSpecBox(Box box)
     {
         ArgumentNullException.ThrowIfNull(box);
         var existing = FindBox(box.BoxNumber);
@@ -429,8 +429,55 @@ public sealed class StackPlanner
         if (!_lastPlan.PlanningResult || _lastPlacements.Count != _group.MutableBoxes.Count)
             return MutationFailure("当前没有完整有效的利用率规划，不能不重新规划地减箱。");
 
+        var removed = CloneBox(existing);
         RemoveUtilizationBox(existing.BoxNumber);
-        return MutationSuccess("不重新规划地减箱完成。");
+
+        var replacement = FindInventoryReplacementBox(removed);
+        if (replacement is null)
+            return MutationSuccess("不重新规划地减箱完成。库存中未找到同尺寸可补箱子，已跳过自动补箱。");
+
+        var addResult = AddBoxWithoutReplanning(replacement);
+        if (!addResult.Succeeded)
+            return MutationFailure($"不重新规划地减箱完成，但自动补箱失败：{addResult.Message}");
+
+        return MutationSuccess($"不重新规划地减箱并自动补箱完成：{replacement.BoxNumber}。");
+    }
+
+    private Box? FindInventoryReplacementBox(Box removed)
+    {
+        string removedKey = BoxTypeKey(removed);
+        var excludedBoxNumbers = _group.MutableBoxes
+            .Select(x => x.BoxNumber)
+            .Append(removed.BoxNumber)
+            .ToHashSet(StringComparer.Ordinal);
+
+        var replacement = _inventoryDatabase
+            .GetAll()
+            .Where(record => !excludedBoxNumbers.Contains(record.BoxNumber))
+            .Where(record => string.Equals(
+                DimensionKey(new BoxDimension
+                {
+                    LengthMm = record.LengthMm,
+                    WidthMm = record.DepthMm,
+                    HeightMm = record.HeightMm,
+                }),
+                removedKey,
+                StringComparison.Ordinal))
+            .OrderBy(record => record.BoxNumber, StringComparer.Ordinal)
+            .FirstOrDefault();
+
+        if (replacement is null)
+            return null;
+
+        return new Box
+        {
+            BoxNumber = replacement.BoxNumber,
+            LengthMm = replacement.DepthMm,
+            WidthMm = replacement.LengthMm,
+            HeightMm = replacement.HeightMm,
+            WeightKg = replacement.WeightKg,
+            Status = BoxStatus.OnShelf,
+        };
     }
 
     /// <summary>
@@ -937,7 +984,7 @@ public sealed class StackPlanner
         UtilizationMutationResult? result = null;
         foreach (string boxNumber in removedBoxNumbers)
         {
-            result = RemoveBoxWithoutReplanning(new Box
+            result = RemoveAndAddSameSpecBox(new Box
             {
                 BoxNumber = boxNumber,
             });
