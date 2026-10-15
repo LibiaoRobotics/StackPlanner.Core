@@ -35,7 +35,6 @@ public sealed class StackPlanner
     private double _palletXMaxMm;
     private double _palletYMinMm;
     private double _palletYMaxMm;
-    private bool _hasGeneratedPlan;
     /// <summary>DLL 当前维护的全部箱子。</summary>
     private readonly BoxGroup _group = new();
     /// <summary>已实际堆垛成功箱子的固定位置，不允许普通重规划改变。</summary>
@@ -315,7 +314,6 @@ public sealed class StackPlanner
             Placements = planPlacements,
             PlanningResult = planPlacements.Length == _group.MutableBoxes.Count,
         };
-        _hasGeneratedPlan = planPlacements.Length > 0 || _group.MutableBoxes.Count == 0;
 
         int upserted = inserted + updated;
         var result = new SucceededPlacementUpsertResult
@@ -474,7 +472,6 @@ public sealed class StackPlanner
             Placements = placements,
             PlanningResult = snapshot.Plan.PlanningResult,
         };
-        _hasGeneratedPlan = placements.Length > 0 || boxes.Length == 0;
     }
 
     /// <summary>
@@ -519,7 +516,6 @@ public sealed class StackPlanner
                 .ToArray(),
             PlanningResult = true,
         };
-        _hasGeneratedPlan = true;
         return MutationSuccess("不重新规划地加箱完成。");
     }
 
@@ -644,101 +640,6 @@ public sealed class StackPlanner
         if (box.Status == BoxStatus.StackingSucceeded)
             _succeeded[boxNumber] = new FixedPlacement(ClonePlacement(placement), box.LengthMm, box.WidthMm, box.HeightMm);
         return true;
-    }
-
-    /// <summary>
-    /// 根据当前箱子状态生成完整、确定性的堆垛方案。
-    /// </summary>
-    /// <remarks>
-    /// 规划顺序为：先恢复成功箱真实占用，再恢复其他非 OnShelf 箱子的已有规划占用，
-    /// 最后为 OnShelf 箱子寻找新位置。非成功箱的规划占用只用于避让，不能作为真实支撑面。
-    /// </remarks>
-    /// <returns>包含所有可规划放置项和整体 PlanningResult 的结果。</returns>
-    public StackPlanResult GeneratePlan()
-    {
-        _logger.Log(
-            PlannerLogLevel.Info,
-            "plan.generate.begin",
-            "开始执行普通堆垛规划。",
-            detail: $"TotalBoxes={_group.MutableBoxes.Count}, Succeeded={_group.MutableBoxes.Count(x => x.Status == BoxStatus.StackingSucceeded)}");
-
-        AssignOrders();
-        var definitionsByTypeId = GetBoxTypeDefinitions()
-            .ToDictionary(item => item.TypeId, item => item, StringComparer.Ordinal);
-        var collisionBoxes = BuildCollisionBoxesByNumber(_group.MutableBoxes, definitionsByTypeId);
-        var all = _group.MutableBoxes
-            .OrderBy(x => x.Order)
-            .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
-            .Select(box => collisionBoxes[box.BoxNumber])
-            .ToArray();
-        var occupied = new List<PlacedBox>();
-        var output = new Dictionary<string, BoxPlacement>(StringComparer.Ordinal);
-        bool success = true;
-
-        // 先恢复真实占用。真实成功箱的位置不能被后续规划改变。
-        foreach (var box in all.Where(x => x.Status == BoxStatus.StackingSucceeded))
-        {
-            if (!_succeeded.TryGetValue(box.BoxNumber, out var fixedData))
-            {
-                success = false;
-                continue;
-            }
-            var placed = ToPlacedBox(box, fixedData.Placement, true);
-            if (!Fits(placed, occupied)) success = false;
-            occupied.Add(placed);
-            output[box.BoxNumber] = fixedData.Placement;
-        }
-
-        // 非货架箱子优先恢复已有方案；没有旧位置时按固定 Order 确定性重建规划占用。
-        foreach (var box in all.Where(x => x.Status != BoxStatus.OnShelf && x.Status != BoxStatus.StackingSucceeded))
-        {
-            BoxPlacement? placement = null;
-            if (_lastPlacements.TryGetValue(box.BoxNumber, out var old))
-                placement = old;
-            if (placement is null)
-                placement = FindPlacement(box, occupied);
-            if (placement is null)
-            {
-                success = false;
-                continue;
-            }
-            var placed = ToPlacedBox(box, placement, false);
-            if (!Fits(placed, occupied)) success = false;
-            occupied.Add(placed);
-            output[box.BoxNumber] = placement;
-        }
-
-        // OnShelf 箱子允许重排：逐层寻找空间利用率最高的同高混合布局。
-        var onShelf = all.Where(x => x.Status == BoxStatus.OnShelf)
-            .OrderByDescending(BoxBaseArea)
-            .ThenBy(x => x.Order)
-            .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
-            .ToArray();
-        SearchState searched = SearchOnShelf(onShelf, occupied);
-        searched = NormalizeOnShelfOrders(searched, all);
-        foreach (var placement in searched.Placements.Values)
-        {
-            output[placement.BoxNumber] = placement;
-        }
-        success &= searched.Placements.Count == onShelf.Length;
-
-        var placements = output.Values.OrderBy(x => x.Order).ThenBy(x => x.BoxNumber, StringComparer.Ordinal).ToArray();
-        placements = NormalizePlacementOrders(placements);
-        foreach (var placement in placements)
-        {
-            var box = FindBox(placement.BoxNumber)!;
-            box.Order = placement.Order;
-        }
-        _lastPlacements.Clear();
-        foreach (var placement in placements) _lastPlacements[placement.BoxNumber] = ClonePlacement(placement);
-        _lastPlan = new StackPlanResult { Placements = placements, PlanningResult = success && placements.Length == all.Length };
-        _hasGeneratedPlan = true;
-        _logger.Log(
-            PlannerLogLevel.Info,
-            "plan.generate.completed",
-            "普通堆垛规划完成。",
-            detail: $"PlanningResult={_lastPlan.PlanningResult}, Placements={_lastPlan.Placements.Count}, TotalBoxes={all.Length}");
-        return ClonePlan(_lastPlan);
     }
 
     /// <summary>
@@ -1777,8 +1678,7 @@ public sealed class StackPlanner
     /// <summary>
     /// 使用当前真实箱子集合执行有限数量的二维利用率规划，并直接返回逐箱堆垛数据。
     /// 本方法复用 <see cref="PlanBestUtilization(IEnumerable{BoxDimension}, double)" /> 的
-    /// 同高度分层、最多三种箱型组合和二维候选搜索思路，但不会调用正式的
-    /// <see cref="GeneratePlan()" />，也不会重新生成箱子数量或箱号。
+    /// 同高度分层、最多三种箱型组合和二维候选搜索思路，不会重新生成箱子数量或箱号。
     /// </summary>
     /// <remarks>
     /// 利用率规划面向“当前仍在货架上的箱子集合”。调用方应在规划前完成箱子的增删；
@@ -1824,7 +1724,6 @@ public sealed class StackPlanner
                 Placements = Array.Empty<BoxPlacement>(),
                 PlanningResult = false,
             };
-            _hasGeneratedPlan = true;
             return ClonePlan(_lastPlan);
         }
 
@@ -1848,7 +1747,6 @@ public sealed class StackPlanner
                     Placements = Array.Empty<BoxPlacement>(),
                     PlanningResult = false,
                 };
-                _hasGeneratedPlan = true;
                 return ClonePlan(_lastPlan);
             }
 
@@ -1867,7 +1765,6 @@ public sealed class StackPlanner
                     Placements = Array.Empty<BoxPlacement>(),
                     PlanningResult = false,
                 };
-                _hasGeneratedPlan = true;
                 return ClonePlan(_lastPlan);
             }
 
@@ -1908,7 +1805,6 @@ public sealed class StackPlanner
                 Placements = Array.Empty<BoxPlacement>(),
                 PlanningResult = true,
             };
-            _hasGeneratedPlan = true;
             return ClonePlan(_lastPlan);
         }
 
@@ -2005,7 +1901,6 @@ public sealed class StackPlanner
             Placements = ordered,
             PlanningResult = ordered.Length == onShelfBoxes.Length,
         };
-        _hasGeneratedPlan = true;
         _logger.Log(
             _lastPlan.PlanningResult ? PlannerLogLevel.Info : PlannerLogLevel.Warning,
             "utilization.plan.completed",
@@ -2043,7 +1938,6 @@ public sealed class StackPlanner
                 Placements = lockedOnly,
                 PlanningResult = true,
             };
-            _hasGeneratedPlan = true;
             _logger.Log(
                 PlannerLogLevel.Info,
                 "utilization.plan.baseline.completed",
@@ -2082,7 +1976,6 @@ public sealed class StackPlanner
                 Placements = Array.Empty<BoxPlacement>(),
                 PlanningResult = false,
             };
-            _hasGeneratedPlan = true;
             return ClonePlan(_lastPlan);
         }
 
@@ -2160,7 +2053,6 @@ public sealed class StackPlanner
                 Placements = Array.Empty<BoxPlacement>(),
                 PlanningResult = false,
             };
-            _hasGeneratedPlan = true;
             return ClonePlan(_lastPlan);
         }
 
@@ -2245,9 +2137,7 @@ public sealed class StackPlanner
             new SearchState(
                 Array.Empty<Box>(),
                 occupied.ToArray(),
-                mergedPlacements,
-                -1,
-                null),
+                mergedPlacements),
             _group.MutableBoxes);
 
         var ordered = normalized.Placements.Values
@@ -2269,7 +2159,6 @@ public sealed class StackPlanner
             Placements = ordered,
             PlanningResult = ordered.Length == expected,
         };
-        _hasGeneratedPlan = true;
         _logger.Log(
             _lastPlan.PlanningResult ? PlannerLogLevel.Info : PlannerLogLevel.Warning,
             "utilization.plan.baseline.completed",
@@ -2650,7 +2539,6 @@ public sealed class StackPlanner
 
     /// <summary>
     /// 仅为利用率规划应用同 TypeId 替换箱的末尾序号。
-    /// 不修改 GeneratePlan 使用的增删箱子顺序逻辑。
     /// </summary>
     private void ApplyPendingUtilizationOrders()
     {
@@ -2882,11 +2770,6 @@ public sealed class StackPlanner
             throw new InvalidOperationException("非 OnShelf 箱子必须已有固定 Order。");
     }
 
-    private BoxPlacement? FindPlacement(Box box, List<PlacedBox> occupied)
-    {
-        return GenerateCandidates(box, occupied).FirstOrDefault()?.Placement;
-    }
-
     /// <summary>
     /// 生成一个箱子的全部合法候选位置，并按固定规则排序。
     /// </summary>
@@ -3031,237 +2914,6 @@ public sealed class StackPlanner
     private static double OverlapLength(double a1, double a2, double b1, double b2) => Math.Max(0, Math.Min(a2, b2) - Math.Max(a1, b1));
     private static double Round(double value) => Math.Round(value, 3, MidpointRounding.AwayFromZero);
 
-    /// <summary>
-    /// 对仍在货架上的箱子执行确定性的分层搜索。
-    /// 中间层只提交达到最低利用率的混合布局；剩余箱子统一作为最高层处理。
-    /// </summary>
-    private SearchState SearchOnShelf(IReadOnlyList<Box> boxes, IReadOnlyList<PlacedBox> initialOccupied)
-        => SearchOnShelf(boxes, initialOccupied,
-            new Dictionary<string, BoxPlacement>(StringComparer.Ordinal),
-            startAboveHighest: true);
-
-    private SearchState SearchOnShelf(
-        IReadOnlyList<Box> boxes,
-        IReadOnlyList<PlacedBox> initialOccupied,
-        IReadOnlyDictionary<string, BoxPlacement> initialPlacements,
-        bool startAboveHighest = true)
-    {
-        var initial = new SearchState(
-            boxes.Where(x => !initialPlacements.ContainsKey(x.BoxNumber)).ToArray(),
-            initialOccupied.ToArray(),
-            new Dictionary<string, BoxPlacement>(initialPlacements, StringComparer.Ordinal),
-            -1,
-            null);
-        if (boxes.Count == 0) return initial;
-
-        var current = initial;
-        while (current.Remaining.Count > 0)
-        {
-            var layerCandidate = FindBestSingleLayerCandidate(current, startAboveHighest);
-            if (layerCandidate is null)
-                break;
-
-            var layer = layerCandidate.State;
-            int layerIndex = layerCandidate.LayerIndex;
-            current = layer;
-        }
-
-        // 没有任何可放位置时结束；尾部模式已经在上面的分支中完成。
-        if (current.Remaining.Count > 0)
-        {
-            var topLayer = FindBestSingleLayerCandidate(current, startAboveHighest)?.State;
-            if (topLayer is not null)
-                current = topLayer;
-        }
-
-        return current;
-    }
-
-    /// <summary>
-    /// 在当前最低可用层执行一次混合箱型有限宽度单层装箱。
-    /// 布局比较严格按利用率、碎片、包围区域、支撑面积和确定性签名进行。
-    /// </summary>
-    private LayerSearchCandidate? FindBestSingleLayerCandidate(
-        SearchState initial,
-        bool startAboveHighest = true)
-    {
-        var heightGroups = new List<List<Box>>();
-        foreach (var box in initial.Remaining
-                     .OrderBy(x => x.HeightMm)
-                     .ThenBy(x => x.Order)
-                     .ThenBy(x => x.BoxNumber, StringComparer.Ordinal))
-        {
-            var group = heightGroups.LastOrDefault();
-            if (group is null || Math.Abs(group[0].HeightMm - box.HeightMm) > Epsilon)
-            {
-                heightGroups.Add(new List<Box> { box });
-            }
-            else
-            {
-                group.Add(box);
-            }
-        }
-
-        LayerSearchCandidate? best = null;
-        foreach (var group in heightGroups)
-        {
-            double height = group[0].HeightMm;
-            var typeKeys = group
-                .Select(BoxTypeKey)
-                .Distinct(StringComparer.Ordinal)
-                .OrderBy(x => x, StringComparer.Ordinal)
-                .ToArray();
-            foreach (var combination in TypeCombinations(typeKeys, maxSize: 3))
-            {
-                var layer = TryPackBestSingleLayer(
-                    initial,
-                    height,
-                    combination.ToHashSet(StringComparer.Ordinal),
-                    startAboveHighest: startAboveHighest);
-                AddLayerCandidate(ref best, initial, layer, singleType: combination.Length == 1, height);
-            }
-        }
-
-        return best;
-    }
-
-    private void AddLayerCandidate(
-        ref LayerSearchCandidate? best,
-        SearchState initial,
-        SearchState? state,
-        bool singleType,
-        double height)
-    {
-        if (state is null)
-            return;
-
-        int layer = GetSearchLayer(state, initial);
-        if (layer == int.MaxValue)
-            return;
-
-        var candidate = new LayerSearchCandidate(state, singleType, height, layer);
-        if (best is null || IsBetterLayerCandidate(candidate, best))
-            best = candidate;
-    }
-
-    private bool IsBetterLayerCandidate(
-        LayerSearchCandidate candidate,
-        LayerSearchCandidate current)
-    {
-        double candidateUtilization = SearchLayerUtilization(candidate.State, candidate.LayerIndex);
-        double currentUtilization = SearchLayerUtilization(current.State, current.LayerIndex);
-        if (candidateUtilization > currentUtilization + Epsilon) return true;
-        if (currentUtilization > candidateUtilization + Epsilon) return false;
-
-        if (candidate.SingleType != current.SingleType)
-            return candidate.SingleType;
-
-        return IsBetterSingleLayer(candidate.State, current.State, candidate.LayerIndex);
-    }
-
-    private SearchState? TryPackBestSingleLayer(
-        SearchState initial,
-        double? requiredHeight = null,
-        IReadOnlySet<string>? allowedTypeKeys = null,
-        bool startAboveHighest = true)
-    {
-        var eligible = initial.Remaining
-            .Where(x => (!requiredHeight.HasValue
-                || Math.Abs(x.HeightMm - requiredHeight.Value) <= Epsilon)
-                && (allowedTypeKeys is null || allowedTypeKeys.Contains(BoxTypeKey(x))))
-            .ToArray();
-        if (eligible.Length == 0)
-            return null;
-
-        int highestOccupiedLayer = initial.Occupied
-            .Select(x => x.Placement.LayerIndex)
-            .DefaultIfEmpty(-1)
-            .Max();
-        int targetLayer = startAboveHighest && highestOccupiedLayer >= 0
-            ? highestOccupiedLayer + 1
-            : eligible
-                .SelectMany(box => GenerateCandidates(box, initial.Occupied))
-                .Select(candidate => candidate.Placement.LayerIndex)
-                .DefaultIfEmpty(int.MaxValue)
-                .Min();
-        if (targetLayer == int.MaxValue)
-            return null;
-
-        var frontier = new[] { initial };
-        SearchState best = initial;
-        for (int depth = 0; depth < eligible.Length && frontier.Length > 0; depth++)
-        {
-            var next = new List<SearchState>();
-            foreach (var state in frontier)
-            {
-                bool expanded = false;
-                // 几何完全相同的箱子只扩展确定性的代表箱，避免为同型箱子的交换顺序
-                // 重复搜索；提交结果时仍然按 Order 和箱号绑定到具体箱子。
-                foreach (var box in state.Remaining
-                             .Where(x => (!requiredHeight.HasValue
-                                 || Math.Abs(x.HeightMm - requiredHeight.Value) <= Epsilon)
-                                 && (allowedTypeKeys is null || allowedTypeKeys.Contains(BoxTypeKey(x))))
-                             .GroupBy(BoxTypeKey, StringComparer.Ordinal)
-                             .Select(group => group
-                                 .OrderBy(x => x.Order)
-                                 .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
-                                 .First())
-                             .OrderByDescending(BoxBaseArea)
-                             .ThenByDescending(BoxVolume)
-                             .ThenBy(x => x.Order)
-                             .ThenBy(x => x.BoxNumber, StringComparer.Ordinal))
-                {
-                    foreach (var candidate in GenerateCandidates(box, state.Occupied)
-                                 .Where(x => x.Placement.LayerIndex == targetLayer))
-                    {
-                        var placed = ToPlacedBox(box, candidate.Placement, false);
-                        if (!Fits(placed, state.Occupied)) continue;
-
-                        var placements = new Dictionary<string, BoxPlacement>(
-                            state.Placements, StringComparer.Ordinal)
-                        {
-                            [box.BoxNumber] = candidate.Placement,
-                        };
-                        var remaining = state.Remaining
-                            .Where(x => !ReferenceEquals(x, box)).ToArray();
-                        next.Add(new SearchState(
-                            remaining,
-                            state.Occupied.Concat(new[] { placed }).ToArray(),
-                            placements,
-                            targetLayer,
-                            BoxTypeKey(box)));
-                        expanded = true;
-                    }
-                }
-
-                // 保留当前层无法继续扩展的终止状态，供评分选择。
-                if (!expanded)
-                    next.Add(state);
-            }
-
-            frontier = next
-                .OrderByDescending(x => SearchLayerUtilization(x, targetLayer))
-                .ThenBy(x => SearchLayerFragmentation(x, targetLayer))
-                .ThenBy(x => SearchLayerBoundingArea(x, targetLayer))
-                .ThenByDescending(x => SearchLayerSupportArea(x, targetLayer))
-                .ThenBy(SearchSignature, StringComparer.Ordinal)
-                .Take(BeamWidth)
-                .ToArray();
-
-            var roundBest = frontier
-                .OrderByDescending(x => SearchLayerUtilization(x, targetLayer))
-                .ThenBy(x => SearchLayerFragmentation(x, targetLayer))
-                .ThenBy(x => SearchLayerBoundingArea(x, targetLayer))
-                .ThenByDescending(x => SearchLayerSupportArea(x, targetLayer))
-                .ThenBy(SearchSignature, StringComparer.Ordinal)
-                .FirstOrDefault();
-            if (roundBest is not null && IsBetterSingleLayer(roundBest, best, targetLayer))
-                best = roundBest;
-        }
-
-        return best.Placements.Count > initial.Placements.Count ? best : null;
-    }
-
     private static IEnumerable<string[]> TypeCombinations(IReadOnlyList<string> keys, int maxSize)
     {
         int limit = Math.Min(maxSize, keys.Count);
@@ -3319,37 +2971,6 @@ public sealed class StackPlanner
         }
     }
 
-    /// <summary>
-    /// 将搜索结果中的 OnShelf 箱子恢复为加入时分配的顺序号，
-    /// 同时避开非 OnShelf 箱子已经锁定的顺序号。
-    /// </summary>
-    private static SearchState NormalizeOnShelfOrders(SearchState state, IReadOnlyList<Box> all)
-    {
-        var orders = all.ToDictionary(x => x.BoxNumber, x => x.Order, StringComparer.Ordinal);
-        var replacements = new Dictionary<string, BoxPlacement>(StringComparer.Ordinal);
-        var boxes = all.ToDictionary(x => x.BoxNumber, StringComparer.Ordinal);
-        var usedOrders = all.Where(x => x.Status != BoxStatus.OnShelf && x.Order >= 0)
-            .Select(x => x.Order)
-            .ToHashSet();
-        int nextOrder = 0;
-        foreach (var placement in state.Placements.Values
-                     .OrderBy(x => x.LayerIndex)
-                     // 参考 SKQ：同层按 X 从大到小、同列按 Y 从大到小下发，
-                     // 让机械臂沿固定方向逐列放置，避免同层顺序看起来无序。
-                     .ThenByDescending(x => x.Xmm)
-                     .ThenByDescending(x => x.Ymm)
-                     .ThenByDescending(x => BoxBaseArea(boxes[x.BoxNumber]))
-                     .ThenBy(x => BoxTypeKey(boxes[x.BoxNumber]), StringComparer.Ordinal)
-                     .ThenBy(x => orders[x.BoxNumber])
-                     .ThenBy(x => x.BoxNumber, StringComparer.Ordinal))
-        {
-            while (usedOrders.Contains(nextOrder)) nextOrder++;
-            replacements[placement.BoxNumber] = placement with { Order = nextOrder++ };
-            usedOrders.Add(replacements[placement.BoxNumber].Order);
-        }
-        return state with { Placements = replacements };
-    }
-
     private static string SameSpecTypeId(Box box)
         => SameSpecTypeId(box.LengthMm, box.WidthMm, box.HeightMm);
 
@@ -3378,101 +2999,7 @@ public sealed class StackPlanner
             box.Height.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
     }
 
-    private int GetSearchLayer(SearchState state, SearchState previous)
-    {
-        var addedNumbers = state.Placements.Keys
-            .Where(number => !previous.Placements.ContainsKey(number))
-            .ToHashSet(StringComparer.Ordinal);
-        return state.Placements.Values
-            .Where(x => addedNumbers.Contains(x.BoxNumber))
-            .Select(x => x.LayerIndex)
-            .DefaultIfEmpty(int.MaxValue)
-            .Min();
-    }
-
-    private double SearchLayerUtilization(SearchState state, int layer)
-    {
-        if (layer == int.MaxValue)
-            return 0;
-
-        double palletArea = (_palletXMaxMm - _palletXMinMm)
-            * (_palletYMaxMm - _palletYMinMm);
-        if (palletArea <= Epsilon)
-            return 0;
-
-        double area = state.Occupied
-            .Where(x => x.Placement.LayerIndex == layer)
-            .Sum(x => x.Width * x.Length);
-        return area / palletArea;
-    }
-
-    private static double SearchLayerBoundingArea(SearchState state, int layer)
-    {
-        var boxes = state.Occupied.Where(x => x.Placement.LayerIndex == layer).ToArray();
-        if (boxes.Length == 0)
-            return 0;
-
-        return (boxes.Max(x => x.Right) - boxes.Min(x => x.Left))
-            * (boxes.Max(x => x.Top) - boxes.Min(x => x.Bottom));
-    }
-
-    private static double SearchLayerFragmentation(SearchState state, int layer)
-    {
-        var boxes = state.Occupied.Where(x => x.Placement.LayerIndex == layer).ToArray();
-        if (boxes.Length == 0)
-            return double.PositiveInfinity;
-
-        double occupiedArea = boxes.Sum(x => x.Width * x.Length);
-        return Math.Max(0, SearchLayerBoundingArea(state, layer) - occupiedArea);
-    }
-
-    private static double SearchLayerSupportArea(SearchState state, int layer)
-    {
-        double supportArea = 0;
-        foreach (var item in state.Occupied.Where(x => x.Placement.LayerIndex == layer))
-        {
-            supportArea += state.Occupied
-                .Where(x => x.TopZ <= item.BaseZ + Epsilon
-                    && Math.Abs(x.TopZ - item.BaseZ) <= Epsilon)
-                .Sum(x => OverlapLength(item.Left, item.Right, x.Left, x.Right)
-                    * OverlapLength(item.Bottom, item.Top, x.Bottom, x.Top));
-        }
-        return supportArea;
-    }
-
-    private bool IsBetterSingleLayer(SearchState candidate, SearchState current, int layer)
-    {
-        double candidateUtilization = SearchLayerUtilization(candidate, layer);
-        double currentUtilization = SearchLayerUtilization(current, layer);
-        if (candidateUtilization > currentUtilization + Epsilon) return true;
-        if (currentUtilization > candidateUtilization + Epsilon) return false;
-
-        double candidateFragmentation = SearchLayerFragmentation(candidate, layer);
-        double currentFragmentation = SearchLayerFragmentation(current, layer);
-        if (candidateFragmentation < currentFragmentation - Epsilon) return true;
-        if (currentFragmentation < candidateFragmentation - Epsilon) return false;
-
-        double candidateBounding = SearchLayerBoundingArea(candidate, layer);
-        double currentBounding = SearchLayerBoundingArea(current, layer);
-        if (candidateBounding < currentBounding - Epsilon) return true;
-        if (currentBounding < candidateBounding - Epsilon) return false;
-
-        double candidateSupport = SearchLayerSupportArea(candidate, layer);
-        double currentSupport = SearchLayerSupportArea(current, layer);
-        if (candidateSupport > currentSupport + Epsilon) return true;
-        if (currentSupport > candidateSupport + Epsilon) return false;
-
-        return string.CompareOrdinal(SearchSignature(candidate), SearchSignature(current)) < 0;
-    }
-
-    private static string SearchSignature(SearchState state) => string.Join(";", state.Placements.Values
-        .OrderBy(x => x.BoxNumber, StringComparer.Ordinal)
-        .Select(x => string.Join("|", x.BoxNumber, x.Xmm.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
-            x.Ymm.ToString("R", System.Globalization.CultureInfo.InvariantCulture), x.Zmm.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
-            x.OrientationDeg, x.LayerIndex)));
-
     private static double BoxBaseArea(Box box) => box.LengthMm * box.WidthMm;
-    private static double BoxVolume(Box box) => BoxBaseArea(box) * box.HeightMm;
     /// <summary>
     /// 将公开的机械 Z 坐标反算为内部箱底高度 BaseZ，供边界、碰撞和支撑计算使用。
     /// </summary>
@@ -3628,13 +3155,8 @@ public sealed class StackPlanner
     private sealed record CandidatePlacement(BoxPlacement Placement, Candidate Candidate, int SupportCount, double SupportArea);
     /// <summary>有限宽度搜索的一层布局状态。</summary>
     private sealed record SearchState(IReadOnlyList<Box> Remaining, IReadOnlyList<PlacedBox> Occupied,
-        IReadOnlyDictionary<string, BoxPlacement> Placements, int PreferredLayer, string? PreferredTypeKey);
+        IReadOnlyDictionary<string, BoxPlacement> Placements);
 
-    private sealed record LayerSearchCandidate(
-        SearchState State,
-        bool SingleType,
-        double HeightMm,
-        int LayerIndex);
     /// <summary>直接二维单层搜索中的一个箱子放置结果。</summary>
     private sealed record DirectLayerPlacement(
         BoxDimension Dimension,
