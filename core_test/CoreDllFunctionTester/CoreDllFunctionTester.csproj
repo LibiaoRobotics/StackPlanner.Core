@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <!-- 使用拷贝到 core_test/lib 的 StackPlanner.Core.dll，不直接引用 Core 工程 -->
+  <ItemGroup>
+    <Reference Include="StackPlanner.Core">
+      <HintPath>..\lib\StackPlanner.Core.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- Core 运行时需要读取 stackplanner.config，随输出目录一起拷贝 -->
+  <ItemGroup>
+    <None Include="..\lib\stackplanner.config" Link="stackplanner.config">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <!-- 仿真模块位于 core_test/仿真，不在本工程目录下，需显式纳入编译 -->
+  <ItemGroup>
+    <Compile Include="..\仿真\**\*.cs" Link="仿真\%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

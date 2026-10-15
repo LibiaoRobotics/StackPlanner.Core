@@ -1,0 +1,840 @@
+<?xml version="1.0"?>
+<doc>
+    <assembly>
+        <name>StackPlanner.Core</name>
+    </assembly>
+    <members>
+        <member name="T:StackPlanner.Core.BoxTypeClassifier">
+            <summary>
+            按本地 stackplanner.config 的箱型定义对库存箱子分类。
+            分类容差固定为 ±30mm，不匹配配置定义归为“未识别”，尺寸存在 0 或非正值归为“非法”。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.BoxTypeClassifier.ClassifyPlanBoxTypeId(System.Double,System.Double,System.Double,System.Double)">
+            <summary>
+            按 Core 规划箱子的尺寸返回箱型 TypeId。
+            规划箱子尺寸语义：LengthMm/HeightMm/WidthMm 对应配置的 RepLengthMm/RepHeightMm/RepDepthMm。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.BoxTypeClassifier.GetDefinitions">
+            <summary>返回 stackplanner.config 中全部箱型定义，供外部（如界面）读取。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.BoxTypeClassifier.GetDefaultUtilizationDimensions">
+            <summary>
+            返回 stackplanner.config 中配置的默认利用率候选尺寸。
+            未配置时返回空数组，由上层决定回退行为。
+            </summary>
+        </member>
+        <member name="T:StackPlanner.Core.BoxStatus">
+            <summary>
+            箱子在供包、运输和堆垛流程中的业务状态。
+            </summary>
+        </member>
+        <member name="F:StackPlanner.Core.BoxStatus.OnShelf">
+            <summary>箱子仍在货架上，可以参与顺序重新规划。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.BoxStatus.RemovedFromShelf">
+            <summary>箱子已经从货架取下，但尚未到达堆垛位置。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.BoxStatus.Arrived">
+            <summary>箱子已经到达堆垛工位，等待机械执行。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.BoxStatus.Stacking">
+            <summary>机械正在执行该箱子的堆垛动作。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.BoxStatus.StackingSucceeded">
+            <summary>箱子已经实际放置成功，形成托盘上的真实固定占用。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.BoxStatus.StackingFailed">
+            <summary>箱子的本次堆垛动作失败，箱子仍保留在集合中等待业务处理。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.PlannerLogLevel">
+            <summary>Core 日志级别，按 Debug/Info/Warning/Error 递增。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.PlannerLogLevel.Debug">
+            <summary>仅用于诊断的细粒度日志。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.PlannerLogLevel.Info">
+            <summary>关键流程的正常信息。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.PlannerLogLevel.Warning">
+            <summary>可恢复但需要关注的异常分支。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.PlannerLogLevel.Error">
+            <summary>流程失败或抛出异常。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.PlannerLogOptions">
+            <summary>Core 日志配置。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerLogOptions.Enabled">
+            <summary>是否启用日志。默认启用。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerLogOptions.MinLevel">
+            <summary>输出阈值，小于该级别的日志会被丢弃。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerLogOptions.MaxBufferedEntries">
+            <summary>内存缓冲区最多保留的日志条数。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerLogOptions.FilePath">
+            <summary>可选日志文件路径；为空时只保留内存日志。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.PlannerLogEntry">
+            <summary>单条 Core 日志记录。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerLogEntry.TimestampUtc">
+            <summary>日志生成时间（UTC）。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerLogEntry.Level">
+            <summary>日志级别。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerLogEntry.EventName">
+            <summary>事件名称，便于调用方筛选统计。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerLogEntry.Message">
+            <summary>简要说明。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerLogEntry.Detail">
+            <summary>可选明细。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerLogEntry.BoxNumber">
+            <summary>可选关联箱号。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.Box">
+            <summary>
+            独立箱子的输入属性和由 DLL 维护的业务规划状态。
+            每个实例代表一个真实箱子，不与其他箱子合并数量。
+            </summary>
+        </member>
+        <member name="P:StackPlanner.Core.Box.BoxNumber">
+            <summary>箱子的唯一业务编号；同一个 <see cref="T:StackPlanner.Core.BoxGroup" /> 内不能重复。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.Box.WeightKg">
+            <summary>箱子重量，单位为 kg；当前版本用于输入校验，重量约束后续接入。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.Box.LengthMm">
+            <summary>箱子长度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.Box.WidthMm">
+            <summary>箱子宽度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.Box.HeightMm">
+            <summary>箱子高度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.Box.Status">
+            <summary>当前业务状态；新箱子默认为 <see cref="F:StackPlanner.Core.BoxStatus.OnShelf" />。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.Box.Order">
+            <summary>
+            当前规划中的堆垛顺序，从 0 开始；-1 表示尚未分配。
+            正常规划完成后，该值等于规划结果 Placements 数组中对应项的下标。
+            <see cref="F:StackPlanner.Core.BoxStatus.Stacking" /> 和 <see cref="F:StackPlanner.Core.BoxStatus.StackingSucceeded" />
+            箱子的顺序视为已锁定；其他未锁定箱子可在重新规划时调整。
+            </summary>
+        </member>
+        <member name="T:StackPlanner.Core.BoxGroup">
+            <summary>
+            当前任务中的独立箱子集合。
+            集合本身不按照箱型合并，也不保存规划器之外的设备状态。
+            </summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxGroup.Boxes">
+            <summary>以只读视图提供当前箱子，防止调用方直接替换集合。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxGroup.MutableBoxes">
+            <summary>供 <see cref="T:StackPlanner.Core.StackPlanner" /> 内部执行增删改的可变集合。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.BoxPlacement">
+            <summary>
+            单个箱子的堆垛规划结果。
+            坐标为毫米，位置使用箱体中心点，朝向只允许 0° 或 90°。
+            </summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxPlacement.Order">
+            <summary>该箱子在所属规划结果 Placements 数组中的下标，从 0 开始。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxPlacement.BoxNumber">
+            <summary>该位置对应的唯一箱号。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxPlacement.Xmm">
+            <summary>箱体中心在托盘坐标系中的 X 坐标，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxPlacement.Ymm">
+            <summary>箱体中心在托盘坐标系中的 Y 坐标，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxPlacement.Zmm">
+            <summary>机械执行使用的 Z 坐标，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxPlacement.OrientationDeg">
+            <summary>箱子的平面朝向，只能是 0 或 90。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxPlacement.LayerIndex">
+            <summary>从托盘底面开始计算的层号，底层为 0。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.StackPlanResult">
+            <summary>
+            一次完整规划的公开结果。
+            结果只包含应用层执行所需的放置项和整体成功标志。
+            </summary>
+        </member>
+        <member name="P:StackPlanner.Core.StackPlanResult.Placements">
+            <summary>按规划顺序排列的箱子放置结果。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.StackPlanResult.PlanningResult">
+            <summary>所有箱子都成功获得合法位置时为 true，否则为 false。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.PlannerSnapshot">
+            <summary>
+            Core 对外发布的完整状态快照，用于跨进程显示和状态恢复。
+            </summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerSnapshot.Boxes">
+            <summary>Core 当前维护的完整箱子集合。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerSnapshot.Plan">
+            <summary>Core 当前维护的规划结果。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.PlannerBoxDetail">
+            <summary>
+            面向 DLL 消费方的逐箱明细视图。
+            字段全部由 Core 生成，不依赖调用方自行拼装。
+            </summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerBoxDetail.Order">
+            <summary>堆垛顺序；未分配时可能为 -1。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerBoxDetail.BoxNumber">
+            <summary>唯一箱号。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerBoxDetail.TypeId">
+            <summary>箱型类别（TypeId）。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerBoxDetail.LengthMm">
+            <summary>箱子长度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerBoxDetail.WidthMm">
+            <summary>箱子宽度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerBoxDetail.HeightMm">
+            <summary>箱子高度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerBoxDetail.WeightKg">
+            <summary>箱子重量，单位为 kg。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerBoxDetail.Status">
+            <summary>箱子当前业务状态。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerBoxDetail.Planned">
+            <summary>该箱子是否已有当前规划放置点。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerBoxDetail.Xmm">
+            <summary>规划点 X，单位为 mm；未规划时为空。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerBoxDetail.Ymm">
+            <summary>规划点 Y，单位为 mm；未规划时为空。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerBoxDetail.Zmm">
+            <summary>规划点 Z，单位为 mm；未规划时为空。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerBoxDetail.OrientationDeg">
+            <summary>规划方向（0 或 90）；未规划时为空。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerBoxDetail.LayerIndex">
+            <summary>规划层数；未规划时为空。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.PlannerBoxDetailResult">
+            <summary>
+            Core 对外提供的逐箱明细结果，用于接口联调与外部系统验证。
+            </summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerBoxDetailResult.PlanningResult">
+            <summary>当前规划整体是否成功。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerBoxDetailResult.TotalBoxes">
+            <summary>当前箱子总数。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerBoxDetailResult.PlannedBoxes">
+            <summary>当前已有规划放置点的箱子数量。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.PlannerBoxDetailResult.Boxes">
+            <summary>逐箱明细。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.UtilizationMutationResult">
+            <summary>利用率规划加减箱操作结果。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.UtilizationMutationResult.Succeeded">
+            <summary>本次操作是否成功。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.UtilizationMutationResult.Message">
+            <summary>Core 返回的操作说明。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.UtilizationMutationResult.Boxes">
+            <summary>操作完成后的箱子集合。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.UtilizationMutationResult.Plan">
+            <summary>操作完成后的规划快照。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.BoxDimension">
+            <summary>仅由箱体尺寸描述的候选箱型。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxDimension.LengthMm">
+            <summary>箱子长度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxDimension.WidthMm">
+            <summary>箱子宽度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxDimension.HeightMm">
+            <summary>箱子高度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxDimension.MinimumCount">
+            <summary>整垛规划中该箱型允许使用的最小数量。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.LayerUtilizationSummary">
+            <summary>单层空间利用率摘要。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.LayerUtilizationSummary.LayerIndex">
+            <summary>层号，从 0 开始。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.LayerUtilizationSummary.Utilization">
+            <summary>本层底面积利用率。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.BoxTypeCount">
+            <summary>一种箱型在最佳方案中的实际数量。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxTypeCount.LengthMm">
+            <summary>箱子长度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxTypeCount.WidthMm">
+            <summary>箱子宽度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxTypeCount.HeightMm">
+            <summary>箱子高度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxTypeCount.Count">
+            <summary>该箱型的规划数量。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.UtilizationPlanResult">
+            <summary>仅按箱体尺寸生成的空间利用率最优规划结果。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.UtilizationPlanResult.PlannedCounts">
+            <summary>各箱型在最佳方案中的实际数量。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.UtilizationPlanResult.Layers">
+            <summary>逐层空间利用率。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.UtilizationPlanResult.Utilization">
+            <summary>整垛各层利用率的平均值。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.UtilizationPlanResult.PlanningResult">
+            <summary>所有箱型的最小数量约束均满足时为 true。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.UtilizationPlanResult.Message">
+            <summary>规划失败时的中文原因；成功时为空字符串。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.InventoryUtilizationPlanResult">
+            <summary>
+            基于库存的利用率规划结果。
+            由 Core 直接返回，包含策略统计与是否已应用到 Core 内存。
+            </summary>
+        </member>
+        <member name="P:StackPlanner.Core.InventoryUtilizationPlanResult.PlanningResult">
+            <summary>空间利用率规划是否成功。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.InventoryUtilizationPlanResult.Message">
+            <summary>结果说明；失败时为中文原因。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.InventoryUtilizationPlanResult.PlannedCounts">
+            <summary>各箱型在最佳方案中的实际数量。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.InventoryUtilizationPlanResult.Layers">
+            <summary>逐层空间利用率。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.InventoryUtilizationPlanResult.Utilization">
+            <summary>整垛各层利用率的平均值。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.InventoryUtilizationPlanResult.Applied">
+            <summary>是否已由 Core 成功将选中箱子写入当前内存快照。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.InventoryUtilizationPlanResult.SelectedBoxCount">
+            <summary>本次由 Core 从库存选中的箱子数量。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.InventoryBoxRecord">
+            <summary>
+            待堆垛库存中的单箱记录。
+            尺寸语义固定为 length/height/depth，对应长/高/宽（单位均为 mm）。
+            </summary>
+        </member>
+        <member name="P:StackPlanner.Core.InventoryBoxRecord.BoxNumber">
+            <summary>箱子的唯一业务编号。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.InventoryBoxRecord.LengthMm">
+            <summary>箱子长度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.InventoryBoxRecord.HeightMm">
+            <summary>箱子高度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.InventoryBoxRecord.DepthMm">
+            <summary>箱子宽度（depth），单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.InventoryBoxRecord.WeightKg">
+            <summary>箱子重量，单位为 kg。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.InventoryBoxRecord.Source">
+            <summary>数据来源标识，如 RackBox。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.InventoryUpsertResult">
+            <summary>库存写入结果。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.InventoryUpsertResult.Invalid">
+            <summary>本次无效记录数量。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.InventoryUpsertResult.Total">
+            <summary>库存中当前有效总数。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.InventoryUpsertResult.Message">
+            <summary>操作说明。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.SucceededPlacementRecord">
+            <summary>
+            已成功堆垛箱子的批量写入记录。
+            </summary>
+        </member>
+        <member name="P:StackPlanner.Core.SucceededPlacementRecord.BoxNumber">
+            <summary>箱子的唯一业务编号。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.SucceededPlacementRecord.LengthMm">
+            <summary>箱子长度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.SucceededPlacementRecord.WidthMm">
+            <summary>箱子宽度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.SucceededPlacementRecord.HeightMm">
+            <summary>箱子高度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.SucceededPlacementRecord.WeightKg">
+            <summary>箱子重量，单位为 kg。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.SucceededPlacementRecord.Placement">
+            <summary>箱子的成功堆垛落点。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.SucceededPlacementUpsertResult">
+            <summary>成功堆垛数据写入结果。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.SucceededPlacementUpsertResult.Invalid">
+            <summary>本次无效记录数量。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.SucceededPlacementUpsertResult.Message">
+            <summary>操作说明。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.BoxTypeDefinition">
+            <summary>Core 配置中的一个箱型定义（来自 stackplanner.config）。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxTypeDefinition.TypeId">
+            <summary>箱型编号。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxTypeDefinition.RepLengthMm">
+            <summary>代表长度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxTypeDefinition.RepHeightMm">
+            <summary>代表高度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxTypeDefinition.RepDepthMm">
+            <summary>代表宽度（depth），单位为 mm。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.BoxTypeAssignment">
+            <summary>单个库存箱子的分类结果。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxTypeAssignment.BoxNumber">
+            <summary>箱子的唯一业务编号。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxTypeAssignment.TypeId">
+            <summary>分类后的类别编号。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxTypeAssignment.LengthMm">
+            <summary>原始长度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxTypeAssignment.HeightMm">
+            <summary>原始高度，单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxTypeAssignment.DepthMm">
+            <summary>原始宽度（depth），单位为 mm。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxTypeAssignment.WeightKg">
+            <summary>原始重量，单位为 kg。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.BoxTypeClassificationResult">
+            <summary>库存箱型分类结果。</summary>
+        </member>
+        <member name="P:StackPlanner.Core.BoxTypeClassificationResult.Assignments">
+            <summary>每个箱子的分类明细。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.InventoryDatabase">
+            <summary>
+            Core 内部维护的待堆垛库存数据库（内存实现）。
+            主键为箱号，写入时采用 upsert 语义。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.InventoryDatabase.GetAll">
+            <summary>读取库存记录副本。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.InventoryDatabase.Clear">
+            <summary>清空库存。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.InventoryDatabase.Upsert(System.Collections.Generic.IEnumerable{StackPlanner.Core.InventoryBoxRecord},System.Boolean)">
+            <summary>
+            批量写入库存数据。
+            replaceAll=true 时先清空库存，再写入本次数据。
+            </summary>
+        </member>
+        <member name="T:StackPlanner.Core.StackPlanner">
+            <summary>
+            纯堆垛集合和确定性规划器。DLL 内部维护集合、顺序、当前方案和成功箱真实占用。
+            </summary>
+        </member>
+        <member name="F:StackPlanner.Core.StackPlanner.PalletXMinMm">
+            <summary>托盘可用区域的 X 最小值，单位为 mm。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.StackPlanner.PalletXMaxMm">
+            <summary>托盘可用区域的 X 最大值，单位为 mm。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.StackPlanner.PalletYMinMm">
+            <summary>托盘可用区域的 Y 最小值，单位为 mm。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.StackPlanner.PalletYMaxMm">
+            <summary>托盘可用区域的 Y 最大值，单位为 mm。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.StackPlanner.StackBoxGapMm">
+            <summary>相邻箱子之间的规划间隙，单位为 mm。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.StackPlanner.StackMaxHeightMm">
+            <summary>托盘允许的最大堆垛高度，单位为 mm。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.StackPlanner.PlaceFloorZMm">
+            <summary>托盘底面对应的机械 Z 基准值，单位为 mm。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.StackPlanner.EdgeMarginMm">
+            <summary>托盘边缘预留距离，单位为 mm。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.StackPlanner.Epsilon">
+            <summary>几何比较使用的固定误差，避免浮点边界导致结果不稳定。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.StackPlanner.BeamWidth">
+            <summary>有限宽度搜索每一轮最多保留的布局数量。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.StackPlanner.MaxCandidatesPerBox">
+            <summary>单个箱子最多保留的候选位置数量。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.StackPlanner._group">
+            <summary>DLL 当前维护的全部箱子。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.StackPlanner._succeeded">
+            <summary>已实际堆垛成功箱子的固定位置，不允许普通重规划改变。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.StackPlanner._lastPlacements">
+            <summary>最近一次完整规划，用于恢复非 OnShelf 箱子的规划占用。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.StackPlanner._pendingReplacementBoxes">
+            <summary>匹配删除记录、等待在利用率规划中追加到同 TypeId 末尾的新箱号。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.StackPlanner._reusableUtilizationPlacements">
+            <summary>删除后保留的、可供同 TypeId 新箱复用的规划位置。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.StackPlanner._inventoryDatabase">
+            <summary>待堆垛库存数据库（与当前规划箱集合解耦）。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.StackPlanner._lastPlan">
+            <summary>对外返回的最近一次规划结果。</summary>
+        </member>
+        <member name="F:StackPlanner.Core.StackPlanner._logger">
+            <summary>Core 内部日志器。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.#ctor">
+            <summary>
+            使用默认托盘边界创建规划器。
+            托盘边界在实例创建后不可修改，保证一次任务内规划结果的坐标系稳定。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.#ctor(System.Double,System.Double,System.Double,System.Double)">
+            <summary>
+            使用指定托盘边界创建规划器。边界单位为 mm，且必须在首次规划前确定。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.ConfigureLogging(StackPlanner.Core.PlannerLogOptions)">
+            <summary>更新日志配置。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.GetRecentLogs(System.Int32)">
+            <summary>获取最近日志（按时间升序）。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.GetBoxes">
+            <summary>
+            获取当前箱子集合的副本。调用方修改返回对象不会影响 DLL 内部状态。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.UpsertInventoryBoxes(System.Collections.Generic.IEnumerable{StackPlanner.Core.InventoryBoxRecord},System.Boolean)">
+            <summary>
+            批量写入待堆垛库存。
+            replaceAll=true 时先清空库存，再写入本次数据。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.UpsertSucceededPlacements(System.Collections.Generic.IEnumerable{StackPlanner.Core.SucceededPlacementRecord},System.Boolean)">
+            <summary>
+            批量写入已成功堆垛数据。
+            replaceAll=true 时先清空当前成功堆垛集合，再写入本次数据。
+            已存在成功箱的 Order 视为锁定值，不允许通过增量写入修改。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.ClearSucceededPlacements">
+            <summary>
+            清空已成功堆垛箱子的固定占用，并将对应箱子恢复为 OnShelf。
+            用于“整垛重新规划”前显式丢弃成功基线。
+            </summary>
+            <returns>本次从 StackingSucceeded 恢复为 OnShelf 的箱子数量。</returns>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.ClassifyInventoryBoxTypes(System.Double)">
+            <summary>
+            对库存箱子进行箱型分类。
+            分类定义来自本地 stackplanner.config，尺寸比较固定使用 ±30mm。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.GetBoxTypeDefinitions">
+            <summary>
+            获取 Core 配置中的全部箱型定义（来自 stackplanner.config），界面以此作为最佳策略箱型的唯一来源。
+            </summary>
+        </member>
+        <member name="P:StackPlanner.Core.StackPlanner.CurrentPlan">
+            <summary>获取最近一次规划结果的副本。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.GetPlannerBoxDetails(System.Double)">
+            <summary>
+            获取逐箱明细视图，包含堆垛顺序、类别、尺寸、重量、状态和规划字段。
+            所有字段均由 Core 输出，供 DLL 消费方直接使用。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.RestoreSnapshot(StackPlanner.Core.PlannerSnapshot)">
+            <summary>
+            从完整快照恢复 Core 状态。恢复前会校验箱号、箱子属性和规划引用关系。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.AddBoxWithoutReplanning(StackPlanner.Core.Box)">
+            <summary>
+            不重新规划地增加一个箱子。
+            新箱子只能使用此前减箱释放的同 TypeId 规划位置；没有可复用位置时不会增加箱子。
+            </summary>
+            <param name="box">待增加的箱子，必须处于 OnShelf 状态。</param>
+            <returns>增加结果，以及操作后的完整箱子集合和规划快照。</returns>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.RemoveAndAddSameSpecBox(StackPlanner.Core.Box)">
+            <summary>
+            不重新规划地删除一个箱子。
+            删除后，同 TypeId 箱子依次使用前一个箱子的规划位置，并保留最后释放的位置供加箱复用。
+            </summary>
+            <param name="box">待删除的箱子；仅使用其 BoxNumber 定位 Core 内部箱子。</param>
+            <returns>删除结果，以及操作后的完整箱子集合和规划快照。</returns>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.UpdateBoxStatus(System.String,StackPlanner.Core.BoxStatus,StackPlanner.Core.BoxPlacement)">
+            <summary>
+            更新箱子的业务状态，并在状态变为 StackingSucceeded 时固化其当前规划位置。
+            该方法只记录业务动作结果，不执行机械动作。
+            </summary>
+            <param name="boxNumber">待更新的唯一箱号。</param>
+            <param name="status">新的业务状态。</param>
+            <param name="actualPlacement">
+            箱子实际堆垛成功时的放置结果；为空时使用规划器当前记录的位置。
+            </param>
+            <returns>箱号存在并完成更新返回 true，否则返回 false。</returns>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.SetInternalPlacement(System.String,StackPlanner.Core.BoxPlacement)">
+            <summary>
+            在核心内部写入箱子已经实际占用的放置位置。
+            外部只通过 <see cref="M:StackPlanner.Core.StackPlanner.UpdateBoxStatus(System.String,StackPlanner.Core.BoxStatus,StackPlanner.Core.BoxPlacement)" />
+            报告业务状态和成功位置，不直接调用此方法。
+            </summary>
+            <param name="boxNumber">箱子的唯一编号。</param>
+            <param name="placement">箱子已经实际使用的放置位置。</param>
+            <returns>箱子存在且位置合法时返回 true。</returns>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.PlanUtilizationFromInventory(System.Double)">
+            <summary>
+            基于库存的利用率规划：先按候选箱型计算最佳策略，由 Core 从库存挑选真实箱号写入当前内存，
+            再对选中的真实箱子执行利用率规划，规划结果保存在 Core 内存快照中。
+            </summary>
+            <param name="maxSelectableWeightKg">库存选箱允许的最大重量（kg），默认 10kg。</param>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.ResolveInventoryUtilizationDimensions">
+            <summary>
+            解析库存利用率规划使用的候选尺寸：优先使用配置默认值，未配置时回退到全部箱型。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.IsSelectableInventoryAssignment(StackPlanner.Core.BoxTypeAssignment,System.Double)">
+            <summary>
+            判断库存箱子是否可用于选箱：箱型有效，且重量在 (0, maxSelectableWeightKg] 内。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.CountSelectableInventoryByType(System.Double,System.Collections.Generic.IReadOnlySet{System.String})">
+            <summary>统计库存中各箱型的可选数量（与选箱使用同一筛选条件）。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.SelectInventoryBoxesForUtilization(System.Collections.Generic.IEnumerable{StackPlanner.Core.BoxDimension},System.Double)">
+            <summary>
+            按候选箱型计算最佳策略，并从库存挑选真实箱号写入当前内存（仅供 <see cref="M:StackPlanner.Core.StackPlanner.PlanUtilizationFromInventory(System.Double)"/> 内部使用）。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.CalculateSucceededBaselineHeight(System.Collections.Generic.IReadOnlyList{StackPlanner.Core.BoxPlacement})">
+            <summary>
+            计算成功基线占用的堆垛高度（从托盘地面起算的最高点）。
+            与 <see cref="M:StackPlanner.Core.StackPlanner.ToPlacedBox(StackPlanner.Core.Box,StackPlanner.Core.BoxPlacement,System.Boolean)"/> 的 TopZ 口径一致：TopZ = PlaceFloorZMm - Zmm。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.GenerateBestUtilizationPlan">
+            <summary>
+            使用当前真实箱子集合执行有限数量的二维利用率规划，并直接返回逐箱堆垛数据。
+            本方法复用内部二维利用率策略：同高度分层、最多三种箱型组合和二维候选搜索，
+            不会重新生成箱子数量或箱号。
+            </summary>
+            <remarks>
+            利用率规划面向“当前仍在货架上的箱子集合”。调用方应在规划前完成箱子的增删；
+            每个真实箱子最多使用一次，输出中的箱号和 Order 与当前集合保持对应。
+            二维排布阶段使用箱型类别代表尺寸，而不是单箱原始尺寸。
+            </remarks>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.ApplyPendingUtilizationOrders">
+            <summary>
+            仅为利用率规划应用同 TypeId 替换箱的末尾序号。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.GenerateCandidates(StackPlanner.Core.Box,System.Collections.Generic.IReadOnlyList{StackPlanner.Core.StackPlanner.PlacedBox})">
+            <summary>
+            生成一个箱子的全部合法候选位置，并按固定规则排序。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.CandidateHeights(System.Collections.Generic.IReadOnlyList{StackPlanner.Core.StackPlanner.PlacedBox})">
+            <summary>
+            返回允许尝试的箱底高度：托盘底面和所有已有箱子的顶部。
+            这样候选箱只能落在托盘或同高支撑面上，不会产生悬空位置。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.HasStableSupport(StackPlanner.Core.StackPlanner.Candidate,System.Collections.Generic.IReadOnlyList{StackPlanner.Core.StackPlanner.PlacedBox})">
+            <summary>
+            判断箱子重心是否落在至少一个实际支撑箱的重叠区域内。
+            仅有边角或边缘交集虽然满足几何不碰撞，但在物理仿真中会产生倾倒。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.Fits(StackPlanner.Core.StackPlanner.PlacedBox,System.Collections.Generic.IReadOnlyList{StackPlanner.Core.StackPlanner.PlacedBox})">
+            <summary>检查放置项是否在托盘边界内，并且没有与已有占用发生碰撞。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.ToPlacedBox(StackPlanner.Core.Box,StackPlanner.Core.BoxPlacement,System.Boolean)">
+            <summary>
+            将公开的机械 Z 坐标反算为内部箱底高度 BaseZ，供边界、碰撞和支撑计算使用。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.FindBox(System.String)">
+            <summary>按唯一箱号查找内部箱子对象。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.ValidateSucceededSet(System.Collections.Generic.IEnumerable{StackPlanner.Core.SucceededPlacementRecord},System.String@)">
+            <summary>
+            校验成功堆垛集合。实际已发生的成功落点不因超出托盘或间距不足而拒绝写入，
+            仅拒绝 Order 重复；几何问题以警告文本返回（message 为空表示无警告）。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.ValidateBox(StackPlanner.Core.Box)">
+            <summary>校验箱号、尺寸和重量，阻止无效几何进入规划器。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.StackPlanner.FixedPlacement">
+            <summary>已堆垛成功箱子的固定位置和尺寸快照。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.FixedPlacement.#ctor(StackPlanner.Core.BoxPlacement,System.Double,System.Double,System.Double)">
+            <summary>已堆垛成功箱子的固定位置和尺寸快照。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.StackPlanner.SucceededBaselineState">
+            <summary>继续规划使用的成功堆垛基线。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.SucceededBaselineState.#ctor(System.Collections.Generic.IReadOnlyList{StackPlanner.Core.Box},System.Collections.Generic.IReadOnlyList{StackPlanner.Core.BoxPlacement})">
+            <summary>继续规划使用的成功堆垛基线。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.StackPlanner.SucceededLayerFillPlan">
+            <summary>成功层补齐计划：补齐数量与后续需要剔除的候选尺寸。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.SucceededLayerFillPlan.#ctor(System.String,StackPlanner.Core.BoxDimension,System.Int32)">
+            <summary>成功层补齐计划：补齐数量与后续需要剔除的候选尺寸。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.StackPlanner.PlacedBox">
+            <summary>
+            规划器内部的三维占用。IsReal 表示真实成功占用，CanSupport 表示其顶部能否支撑后续箱子。
+            </summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.PlacedBox.#ctor(System.Double,System.Double,System.Double,System.Double,System.Double,System.Double,StackPlanner.Core.BoxPlacement,System.Boolean,System.Boolean)">
+            <summary>
+            规划器内部的三维占用。IsReal 表示真实成功占用，CanSupport 表示其顶部能否支撑后续箱子。
+            </summary>
+        </member>
+        <member name="T:StackPlanner.Core.StackPlanner.Candidate">
+            <summary>待筛选的候选位置及其确定性排序所需的评分信息。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.Candidate.#ctor(System.Double,System.Double,System.Double,System.Double,System.Double,System.Double,System.Int32,System.Int32)">
+            <summary>待筛选的候选位置及其确定性排序所需的评分信息。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.StackPlanner.CandidatePlacement">
+            <summary>单个箱子的合法候选位置及其内部评分。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.CandidatePlacement.#ctor(StackPlanner.Core.BoxPlacement,StackPlanner.Core.StackPlanner.Candidate,System.Int32,System.Double)">
+            <summary>单个箱子的合法候选位置及其内部评分。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.StackPlanner.SearchState">
+            <summary>有限宽度搜索的一层布局状态。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.SearchState.#ctor(System.Collections.Generic.IReadOnlyList{StackPlanner.Core.Box},System.Collections.Generic.IReadOnlyList{StackPlanner.Core.StackPlanner.PlacedBox},System.Collections.Generic.IReadOnlyDictionary{System.String,StackPlanner.Core.BoxPlacement})">
+            <summary>有限宽度搜索的一层布局状态。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.StackPlanner.DirectLayerPlacement">
+            <summary>直接二维单层搜索中的一个箱子放置结果。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.DirectLayerPlacement.#ctor(StackPlanner.Core.BoxDimension,System.Double,System.Double,System.Double,System.Double,System.Int32)">
+            <summary>直接二维单层搜索中的一个箱子放置结果。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.StackPlanner.DirectLayerState">
+            <summary>直接二维单层搜索状态。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.DirectLayerState.#ctor(System.Collections.Generic.IReadOnlyList{StackPlanner.Core.StackPlanner.DirectLayerPlacement},System.Double)">
+            <summary>直接二维单层搜索状态。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.StackPlanner.DirectLayerResult">
+            <summary>一个确定性的单层布局候选。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.DirectLayerResult.#ctor(System.Double,System.Collections.Generic.IReadOnlyList{StackPlanner.Core.StackPlanner.DirectLayerPlacement},System.Double,System.String)">
+            <summary>一个确定性的单层布局候选。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.StackPlanner.UtilizationPlanBox">
+            <summary>利用率规划内部箱子模型：保留原始箱号与顺序，尺寸使用类别代表值。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.UtilizationPlanBox.#ctor(StackPlanner.Core.Box,System.String,System.Double,System.Double,System.Double,System.String)">
+            <summary>利用率规划内部箱子模型：保留原始箱号与顺序，尺寸使用类别代表值。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.StackPlanner.DirectBoxLayerPlacement">
+            <summary>有限真实箱子的一层二维放置结果。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.DirectBoxLayerPlacement.#ctor(StackPlanner.Core.StackPlanner.UtilizationPlanBox,System.Double,System.Double,System.Double,System.Double,System.Int32)">
+            <summary>有限真实箱子的一层二维放置结果。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.StackPlanner.DirectBoxLayerState">
+            <summary>有限真实箱子的一层二维搜索状态。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.DirectBoxLayerState.#ctor(System.Collections.Generic.IReadOnlyList{StackPlanner.Core.StackPlanner.DirectBoxLayerPlacement},System.Double,System.Collections.Generic.IReadOnlyList{StackPlanner.Core.StackPlanner.UtilizationPlanBox})">
+            <summary>有限真实箱子的一层二维搜索状态。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.StackPlanner.DirectBoxLayerResult">
+            <summary>绑定真实箱子的单层二维布局候选。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.DirectBoxLayerResult.#ctor(System.Double,System.Collections.Generic.IReadOnlyList{StackPlanner.Core.StackPlanner.DirectBoxLayerPlacement},System.Double,System.String)">
+            <summary>绑定真实箱子的单层二维布局候选。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.StackPlanner.DirectStackResult">
+            <summary>不同高度单层方案组合后的整垛结果。</summary>
+        </member>
+        <member name="M:StackPlanner.Core.StackPlanner.DirectStackResult.#ctor(System.Collections.Generic.IReadOnlyList{StackPlanner.Core.StackPlanner.DirectLayerResult},System.Double,System.Int32,System.String)">
+            <summary>不同高度单层方案组合后的整垛结果。</summary>
+        </member>
+        <member name="T:StackPlanner.Core.StackPlannerLogger">
+            <summary>
+            Core 内部日志器：支持内存环形缓冲与可选文件落盘。
+            </summary>
+        </member>
+    </members>
+</doc>
