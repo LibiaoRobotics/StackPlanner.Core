@@ -322,6 +322,67 @@ public sealed class StackPlanner
     }
 
     /// <summary>
+    /// 清空已成功堆垛箱子的固定占用，并将对应箱子恢复为 OnShelf。
+    /// 用于“整垛重新规划”前显式丢弃成功基线。
+    /// </summary>
+    /// <returns>本次从 StackingSucceeded 恢复为 OnShelf 的箱子数量。</returns>
+    public int ClearSucceededPlacements()
+    {
+        _logger.Log(
+            PlannerLogLevel.Info,
+            "succeeded.clear.begin",
+            "开始清空成功堆垛数据。",
+            detail: $"SucceededCount={_succeeded.Count}");
+
+        var clearedNumbers = new HashSet<string>(StringComparer.Ordinal);
+        for (int index = 0; index < _group.MutableBoxes.Count; index++)
+        {
+            var box = _group.MutableBoxes[index];
+            if (box.Status != BoxStatus.StackingSucceeded)
+                continue;
+
+            _group.MutableBoxes[index] = box with
+            {
+                Status = BoxStatus.OnShelf,
+                Order = -1,
+            };
+            clearedNumbers.Add(box.BoxNumber);
+        }
+
+        _succeeded.Clear();
+        foreach (var boxNumber in clearedNumbers)
+            _lastPlacements.Remove(boxNumber);
+
+        var existingNumbers = _group.MutableBoxes
+            .Select(x => x.BoxNumber)
+            .ToHashSet(StringComparer.Ordinal);
+        foreach (var boxNumber in _lastPlacements.Keys.ToArray())
+        {
+            if (!existingNumbers.Contains(boxNumber))
+                _lastPlacements.Remove(boxNumber);
+        }
+
+        var planPlacements = _lastPlacements.Values
+            .Where(item => existingNumbers.Contains(item.BoxNumber))
+            .OrderBy(item => item.Order)
+            .ThenBy(item => item.BoxNumber, StringComparer.Ordinal)
+            .Select(ClonePlacement)
+            .ToArray();
+        _lastPlan = new StackPlanResult
+        {
+            Placements = planPlacements,
+            PlanningResult = planPlacements.Length == _group.MutableBoxes.Count,
+        };
+
+        _logger.Log(
+            PlannerLogLevel.Info,
+            "succeeded.clear.completed",
+            "成功堆垛数据已清空。",
+            detail: $"Cleared={clearedNumbers.Count}, RemainingSucceeded={_succeeded.Count}");
+        return clearedNumbers.Count;
+    }
+
+    /// <summary>
     /// 对库存箱子进行箱型分类。
     /// 分类定义来自本地 stackplanner.config，尺寸比较固定使用 ±30mm。
     /// </summary>
