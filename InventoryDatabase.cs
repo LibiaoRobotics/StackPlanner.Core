@@ -46,12 +46,8 @@ internal sealed class InventoryDatabase
             _records[normalized.BoxNumber] = normalized;
         }
 
-        int upserted = inserted + updated;
         return new InventoryUpsertResult
         {
-            Upserted = upserted,
-            Inserted = inserted,
-            Updated = updated,
             Invalid = invalid,
             Total = _records.Count,
             Message = $"库存写入完成：新增 {inserted}，更新 {updated}，无效 {invalid}，当前总数 {_records.Count}。",
@@ -78,7 +74,6 @@ internal sealed class InventoryDatabase
         {
             BoxNumber = boxNumber,
             Source = record.Source?.Trim() ?? string.Empty,
-            UpdatedAtUtc = DateTimeOffset.UtcNow,
         };
         return true;
     }

@@ -93,7 +93,7 @@ public sealed record Box
 /// 当前任务中的独立箱子集合。
 /// 集合本身不按照箱型合并，也不保存规划器之外的设备状态。
 /// </summary>
-public sealed class BoxGroup
+internal sealed class BoxGroup
 {
     private readonly List<Box> _boxes = new();
     /// <summary>以只读视图提供当前箱子，防止调用方直接替换集合。</summary>
@@ -139,20 +139,12 @@ public sealed class StackPlanResult
 /// <summary>
 /// Core 对外发布的完整状态快照，用于跨进程显示和状态恢复。
 /// </summary>
-public sealed class PlannerSnapshot
+internal sealed class PlannerSnapshot
 {
-    /// <summary>快照文件结构版本。</summary>
-    public int SchemaVersion { get; init; } = 1;
-    /// <summary>同一快照文件内单调递增的版本号。</summary>
-    public required long Revision { get; init; }
-    /// <summary>快照发布时间（UTC）。</summary>
-    public required DateTimeOffset UpdatedAtUtc { get; init; }
     /// <summary>Core 当前维护的完整箱子集合。</summary>
     public required IReadOnlyList<Box> Boxes { get; init; }
     /// <summary>Core 当前维护的规划结果。</summary>
     public required StackPlanResult Plan { get; init; }
-    /// <summary>利用率规划删除箱子后保留的可复用位置。</summary>
-    public required IReadOnlyList<ReusablePlacementSet> ReusablePlacements { get; init; }
 }
 
 /// <summary>
@@ -196,8 +188,6 @@ public sealed class PlannerBoxDetail
 /// </summary>
 public sealed class PlannerBoxDetailResult
 {
-    /// <summary>分类容差，单位为 mm。</summary>
-    public required double ToleranceMm { get; init; }
     /// <summary>当前规划整体是否成功。</summary>
     public required bool PlanningResult { get; init; }
     /// <summary>当前箱子总数。</summary>
@@ -206,17 +196,6 @@ public sealed class PlannerBoxDetailResult
     public required int PlannedBoxes { get; init; }
     /// <summary>逐箱明细。</summary>
     public required IReadOnlyList<PlannerBoxDetail> Boxes { get; init; }
-    /// <summary>结果生成时间（UTC）。</summary>
-    public required DateTimeOffset GeneratedAtUtc { get; init; }
-}
-
-/// <summary>按完整尺寸归类的可复用规划位置。</summary>
-public sealed class ReusablePlacementSet
-{
-    /// <summary>可复用位置所属的箱子完整尺寸。</summary>
-    public required BoxDimension Dimension { get; init; }
-    /// <summary>按规划顺序排列的可复用位置。</summary>
-    public required IReadOnlyList<BoxPlacement> Placements { get; init; }
 }
 
 /// <summary>利用率规划加减箱操作结果。</summary>
@@ -230,12 +209,10 @@ public sealed class UtilizationMutationResult
     public required IReadOnlyList<Box> Boxes { get; init; }
     /// <summary>操作完成后的规划快照。</summary>
     public required StackPlanResult Plan { get; init; }
-    /// <summary>操作完成后仍可复用的规划位置。</summary>
-    public required IReadOnlyList<ReusablePlacementSet> ReusablePlacements { get; init; }
 }
 
 /// <summary>仅由箱体尺寸描述的候选箱型。</summary>
-public sealed record BoxDimension
+internal sealed record BoxDimension
 {
     /// <summary>箱子长度，单位为 mm。</summary>
     public required double LengthMm { get; init; }
@@ -270,7 +247,7 @@ public sealed class BoxTypeCount
 }
 
 /// <summary>仅按箱体尺寸生成的空间利用率最优规划结果。</summary>
-public sealed class UtilizationPlanResult
+internal sealed class UtilizationPlanResult
 {
     /// <summary>各箱型在最佳方案中的实际数量。</summary>
     public required IReadOnlyList<BoxTypeCount> PlannedCounts { get; init; }
@@ -324,19 +301,11 @@ public sealed record InventoryBoxRecord
     public required double WeightKg { get; init; }
     /// <summary>数据来源标识，如 RackBox。</summary>
     public string Source { get; init; } = string.Empty;
-    /// <summary>该记录最近一次被写入库存数据库的时间（UTC）。</summary>
-    public DateTimeOffset UpdatedAtUtc { get; init; } = DateTimeOffset.UtcNow;
 }
 
 /// <summary>库存写入结果。</summary>
 public sealed class InventoryUpsertResult
 {
-    /// <summary>本次成功写入（新增+更新）的数量。</summary>
-    public required int Upserted { get; init; }
-    /// <summary>本次新增数量。</summary>
-    public required int Inserted { get; init; }
-    /// <summary>本次更新数量。</summary>
-    public required int Updated { get; init; }
     /// <summary>本次无效记录数量。</summary>
     public required int Invalid { get; init; }
     /// <summary>库存中当前有效总数。</summary>
@@ -367,22 +336,14 @@ public sealed class SucceededPlacementRecord
 /// <summary>成功堆垛数据写入结果。</summary>
 public sealed class SucceededPlacementUpsertResult
 {
-    /// <summary>本次成功写入（新增+更新）的数量。</summary>
-    public required int Upserted { get; init; }
-    /// <summary>本次新增数量。</summary>
-    public required int Inserted { get; init; }
-    /// <summary>本次更新数量。</summary>
-    public required int Updated { get; init; }
     /// <summary>本次无效记录数量。</summary>
     public required int Invalid { get; init; }
-    /// <summary>当前成功堆垛箱子总数。</summary>
-    public required int TotalSucceeded { get; init; }
     /// <summary>操作说明。</summary>
     public required string Message { get; init; }
 }
 
 /// <summary>Core 配置中的一个箱型定义（来自 stackplanner.config）。</summary>
-public sealed class BoxTypeDefinition
+internal sealed class BoxTypeDefinition
 {
     /// <summary>箱型编号。</summary>
     public required string TypeId { get; init; }
@@ -394,29 +355,8 @@ public sealed class BoxTypeDefinition
     public required double RepDepthMm { get; init; }
 }
 
-/// <summary>一个箱型分类簇的摘要。</summary>
-public sealed class BoxTypeClusterSummary
-{
-    /// <summary>类别编号。</summary>
-    public required string TypeId { get; init; }
-    /// <summary>该类别内箱子数量。</summary>
-    public required int Count { get; init; }
-    /// <summary>代表长度，单位为 mm。</summary>
-    public required double RepLengthMm { get; init; }
-    /// <summary>代表高度，单位为 mm。</summary>
-    public required double RepHeightMm { get; init; }
-    /// <summary>代表宽度（depth），单位为 mm。</summary>
-    public required double RepDepthMm { get; init; }
-    /// <summary>该类别平均重量，单位为 kg。</summary>
-    public required double WeightAvgKg { get; init; }
-    /// <summary>该类别最小重量，单位为 kg。</summary>
-    public required double WeightMinKg { get; init; }
-    /// <summary>该类别最大重量，单位为 kg。</summary>
-    public required double WeightMaxKg { get; init; }
-}
-
 /// <summary>单个库存箱子的分类结果。</summary>
-public sealed class BoxTypeAssignment
+internal sealed class BoxTypeAssignment
 {
     /// <summary>箱子的唯一业务编号。</summary>
     public required string BoxNumber { get; init; }
@@ -430,29 +370,11 @@ public sealed class BoxTypeAssignment
     public required double DepthMm { get; init; }
     /// <summary>原始重量，单位为 kg。</summary>
     public required double WeightKg { get; init; }
-    /// <summary>归类基准长度，单位为 mm；未匹配配置类别时为空。</summary>
-    public double? BaseLengthMm { get; init; }
-    /// <summary>归类基准高度，单位为 mm；未匹配配置类别时为空。</summary>
-    public double? BaseHeightMm { get; init; }
-    /// <summary>归类基准宽度（depth），单位为 mm；未匹配配置类别时为空。</summary>
-    public double? BaseDepthMm { get; init; }
-    /// <summary>数据来源标识，如 RackBox。</summary>
-    public string Source { get; init; } = string.Empty;
 }
 
 /// <summary>库存箱型分类结果。</summary>
-public sealed class BoxTypeClassificationResult
+internal sealed class BoxTypeClassificationResult
 {
-    /// <summary>分类容差，单位为 mm。</summary>
-    public required double ToleranceMm { get; init; }
-    /// <summary>参与分类的箱子总数。</summary>
-    public required int TotalBoxes { get; init; }
-    /// <summary>分类簇数量。</summary>
-    public required int ClusterCount { get; init; }
-    /// <summary>分类簇明细。</summary>
-    public required IReadOnlyList<BoxTypeClusterSummary> Clusters { get; init; }
     /// <summary>每个箱子的分类明细。</summary>
     public required IReadOnlyList<BoxTypeAssignment> Assignments { get; init; }
-    /// <summary>结果生成时间（UTC）。</summary>
-    public required DateTimeOffset GeneratedAtUtc { get; init; }
 }

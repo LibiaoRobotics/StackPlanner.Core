@@ -41,14 +41,10 @@ public sealed class StackPlanner
     private readonly Dictionary<string, FixedPlacement> _succeeded = new(StringComparer.Ordinal);
     /// <summary>最近一次完整规划，用于恢复非 OnShelf 箱子的规划占用。</summary>
     private readonly Dictionary<string, BoxPlacement> _lastPlacements = new(StringComparer.Ordinal);
-    /// <summary>已删除但等待同 TypeId 箱子补位的次数，仅供利用率规划使用。</summary>
-    private readonly Dictionary<string, int> _pendingReplacementCounts = new(StringComparer.Ordinal);
     /// <summary>匹配删除记录、等待在利用率规划中追加到同 TypeId 末尾的新箱号。</summary>
     private readonly Dictionary<string, HashSet<string>> _pendingReplacementBoxes = new(StringComparer.Ordinal);
     /// <summary>删除后保留的、可供同 TypeId 新箱复用的规划位置。</summary>
     private readonly Dictionary<string, List<BoxPlacement>> _reusableUtilizationPlacements = new(StringComparer.Ordinal);
-    /// <summary>记录可复用位置所属 TypeId 的尺寸，用于对外输出兼容维度信息。</summary>
-    private readonly Dictionary<string, BoxDimension> _reusablePlacementTypeDimensions = new(StringComparer.Ordinal);
     /// <summary>待堆垛库存数据库（与当前规划箱集合解耦）。</summary>
     private readonly InventoryDatabase _inventoryDatabase = new();
     /// <summary>对外返回的最近一次规划结果。</summary>
@@ -109,7 +105,7 @@ public sealed class StackPlanner
     /// <summary>
     /// 获取当前箱子集合的副本。调用方修改返回对象不会影响 DLL 内部状态。
     /// </summary>
-    public IReadOnlyList<Box> GetBoxes() => _group.Boxes.Select(CloneBox).ToArray();
+    private IReadOnlyList<Box> GetBoxes() => _group.Boxes.Select(CloneBox).ToArray();
 
     /// <summary>
     /// 批量写入待堆垛库存。
@@ -126,7 +122,7 @@ public sealed class StackPlanner
                 PlannerLogLevel.Info,
                 "inventory.upsert",
                 "库存写入完成。",
-                detail: $"ReplaceAll={replaceAll}, Upserted={result.Upserted}, Inserted={result.Inserted}, Updated={result.Updated}, Invalid={result.Invalid}, Total={result.Total}");
+                detail: $"ReplaceAll={replaceAll}, Invalid={result.Invalid}, Total={result.Total}");
             return result;
         }
         catch (Exception ex)
@@ -216,11 +212,7 @@ public sealed class StackPlanner
                 detail: validationMessage);
             return new SucceededPlacementUpsertResult
             {
-                Upserted = 0,
-                Inserted = 0,
-                Updated = 0,
                 Invalid = invalid + valid.Count,
-                TotalSucceeded = _succeeded.Count,
                 Message = validationMessage,
             };
         }
@@ -315,14 +307,9 @@ public sealed class StackPlanner
             PlanningResult = planPlacements.Length == _group.MutableBoxes.Count,
         };
 
-        int upserted = inserted + updated;
         var result = new SucceededPlacementUpsertResult
         {
-            Upserted = upserted,
-            Inserted = inserted,
-            Updated = updated,
             Invalid = invalid,
-            TotalSucceeded = _succeeded.Count,
             Message = $"成功堆垛写入完成：新增 {inserted}，更新 {updated}，无效 {invalid}，当前成功总数 {_succeeded.Count}。" + validationMessage,
         };
 
@@ -330,7 +317,7 @@ public sealed class StackPlanner
             PlannerLogLevel.Info,
             "succeeded.upsert.completed",
             "成功堆垛数据写入完成。",
-            detail: $"ReplaceAll={replaceAll}, Upserted={result.Upserted}, Inserted={result.Inserted}, Updated={result.Updated}, Invalid={result.Invalid}, TotalSucceeded={result.TotalSucceeded}");
+            detail: $"ReplaceAll={replaceAll}, Invalid={result.Invalid}, TotalSucceeded={_succeeded.Count}");
         return result;
     }
 
@@ -338,13 +325,13 @@ public sealed class StackPlanner
     /// 对库存箱子进行箱型分类。
     /// 分类定义来自本地 stackplanner.config，尺寸比较固定使用 ±30mm。
     /// </summary>
-    public BoxTypeClassificationResult ClassifyInventoryBoxTypes(double toleranceMm = 30)
+    private BoxTypeClassificationResult ClassifyInventoryBoxTypes(double toleranceMm = 30)
         => BoxTypeClassifier.Classify(_inventoryDatabase.GetAll(), toleranceMm);
 
     /// <summary>
     /// 获取 Core 配置中的全部箱型定义（来自 stackplanner.config），界面以此作为最佳策略箱型的唯一来源。
     /// </summary>
-    public IReadOnlyList<BoxTypeDefinition> GetBoxTypeDefinitions()
+    private IReadOnlyList<BoxTypeDefinition> GetBoxTypeDefinitions()
         => BoxTypeClassifier.GetDefinitions();
 
     /// <summary>获取最近一次规划结果的副本。</summary>
@@ -400,23 +387,19 @@ public sealed class StackPlanner
 
         return new PlannerBoxDetailResult
         {
-            ToleranceMm = toleranceMm,
             PlanningResult = _lastPlan.PlanningResult,
             TotalBoxes = _group.Boxes.Count,
             PlannedBoxes = placementsByNumber.Count,
             Boxes = details,
-            GeneratedAtUtc = DateTimeOffset.UtcNow,
         };
     }
 
     /// <summary>
     /// 从完整快照恢复 Core 状态。恢复前会校验箱号、箱子属性和规划引用关系。
     /// </summary>
-    public void RestoreSnapshot(PlannerSnapshot snapshot)
+    private void RestoreSnapshot(PlannerSnapshot snapshot)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
-        if (snapshot.SchemaVersion != 1)
-            throw new InvalidDataException($"不支持的规划快照版本：{snapshot.SchemaVersion}");
 
         var boxes = snapshot.Boxes.Select(CloneBox).ToArray();
         var numbers = new HashSet<string>(StringComparer.Ordinal);
@@ -436,10 +419,8 @@ public sealed class StackPlanner
         _group.MutableBoxes.AddRange(boxes);
         _succeeded.Clear();
         _lastPlacements.Clear();
-        _pendingReplacementCounts.Clear();
         _pendingReplacementBoxes.Clear();
         _reusableUtilizationPlacements.Clear();
-        _reusablePlacementTypeDimensions.Clear();
 
         foreach (var placement in placements)
             _lastPlacements[placement.BoxNumber] = placement;
@@ -450,23 +431,6 @@ public sealed class StackPlanner
             _succeeded[box.BoxNumber] = new FixedPlacement(
                 ClonePlacement(placement), box.LengthMm, box.WidthMm, box.HeightMm);
         }
-        foreach (var reusableSet in snapshot.ReusablePlacements)
-        {
-            string key = SameSpecTypeId(
-                reusableSet.Dimension.LengthMm,
-                reusableSet.Dimension.WidthMm,
-                reusableSet.Dimension.HeightMm);
-            _reusableUtilizationPlacements[key] = reusableSet.Placements
-                .Select(ClonePlacement)
-                .ToList();
-            _reusablePlacementTypeDimensions[key] = new BoxDimension
-            {
-                LengthMm = reusableSet.Dimension.LengthMm,
-                WidthMm = reusableSet.Dimension.WidthMm,
-                HeightMm = reusableSet.Dimension.HeightMm,
-            };
-        }
-
         _lastPlan = new StackPlanResult
         {
             Placements = placements,
@@ -480,7 +444,7 @@ public sealed class StackPlanner
     /// </summary>
     /// <param name="box">待增加的箱子，必须处于 OnShelf 状态。</param>
     /// <returns>增加结果，以及操作后的完整箱子集合和规划快照。</returns>
-    public UtilizationMutationResult AddBoxWithoutReplanning(Box box)
+    private UtilizationMutationResult AddBoxWithoutReplanning(Box box)
     {
         ArgumentNullException.ThrowIfNull(box);
         ValidateBox(box);
@@ -642,19 +606,6 @@ public sealed class StackPlanner
         return true;
     }
 
-    /// <summary>
-    /// 根据候选尺寸生成逐层空间利用率规划，并读取库存中各箱型的可选数量作为上限。
-    /// 每个箱型的上限 = 库存中同类别、重量在 (0, maxSelectableWeightKg] 内的箱子数量；
-    /// 库存中没有该类箱子时上限为 0，不参与规划。结果同时返回箱子数量和空间利用率。
-    /// </summary>
-    /// <param name="dimensions">候选箱型尺寸与最小数量。</param>
-    /// <param name="maxSelectableWeightKg">库存选箱允许的最大重量（kg），默认 10kg。</param>
-    /// <exception cref="ArgumentOutOfRangeException">maxSelectableWeightKg 不是有限正数。</exception>
-    public UtilizationPlanResult PlanBestUtilization(
-        IEnumerable<BoxDimension> dimensions,
-        double maxSelectableWeightKg = DefaultMaxSelectableWeightKg)
-        => PlanBestUtilizationCore(dimensions, maxSelectableWeightKg, excludedInventoryBoxNumbers: null);
-
     private UtilizationPlanResult PlanBestUtilizationCore(
         IEnumerable<BoxDimension> dimensions,
         double maxSelectableWeightKg,
@@ -776,17 +727,11 @@ public sealed class StackPlanner
     /// 基于库存的利用率规划：先按候选箱型计算最佳策略，由 Core 从库存挑选真实箱号写入当前内存，
     /// 再对选中的真实箱子执行利用率规划，规划结果保存在 Core 内存快照中。
     /// </summary>
-    /// <param name="dimensions">
-    /// 候选箱型尺寸与最小数量。
-    /// 传入 null 或空集合时，优先使用 stackplanner.config 的 defaultUtilizationDimensions；
-    /// 未配置该字段时回退到全部箱型尺寸（MinimumCount=0）。
-    /// </param>
     /// <param name="maxSelectableWeightKg">库存选箱允许的最大重量（kg），默认 10kg。</param>
     public InventoryUtilizationPlanResult PlanUtilizationFromInventory(
-        IEnumerable<BoxDimension>? dimensions = null,
         double maxSelectableWeightKg = DefaultMaxSelectableWeightKg)
     {
-        var resolvedDimensions = ResolveInventoryUtilizationDimensions(dimensions);
+        var resolvedDimensions = ResolveInventoryUtilizationDimensions();
         _logger.Log(
             PlannerLogLevel.Info,
             "utilization.inventory.begin",
@@ -849,18 +794,10 @@ public sealed class StackPlanner
     }
 
     /// <summary>
-    /// 解析库存利用率规划使用的候选尺寸：调用方传参优先；未传或空集合时回退到配置箱型。
+    /// 解析库存利用率规划使用的候选尺寸：优先使用配置默认值，未配置时回退到全部箱型。
     /// </summary>
-    private IReadOnlyList<BoxDimension> ResolveInventoryUtilizationDimensions(
-        IEnumerable<BoxDimension>? dimensions)
+    private IReadOnlyList<BoxDimension> ResolveInventoryUtilizationDimensions()
     {
-        if (dimensions is not null)
-        {
-            var provided = dimensions.ToArray();
-            if (provided.Length > 0)
-                return provided;
-        }
-
         var defaultsFromConfig = BoxTypeClassifier.GetDefaultUtilizationDimensions();
         if (defaultsFromConfig.Count > 0)
             return defaultsFromConfig;
@@ -1382,15 +1319,12 @@ public sealed class StackPlanner
 
         RestoreSnapshot(new PlannerSnapshot
         {
-            Revision = 0,
-            UpdatedAtUtc = DateTimeOffset.UtcNow,
             Boxes = snapshotBoxes,
             Plan = new StackPlanResult
             {
                 Placements = snapshotPlacements,
                 PlanningResult = snapshotPlacements.Length == snapshotBoxes.Length,
             },
-            ReusablePlacements = Array.Empty<ReusablePlacementSet>(),
         });
 
         string message = succeededBaseline.Boxes.Count == 0
@@ -1677,15 +1611,15 @@ public sealed class StackPlanner
 
     /// <summary>
     /// 使用当前真实箱子集合执行有限数量的二维利用率规划，并直接返回逐箱堆垛数据。
-    /// 本方法复用 <see cref="PlanBestUtilization(IEnumerable{BoxDimension}, double)" /> 的
-    /// 同高度分层、最多三种箱型组合和二维候选搜索思路，不会重新生成箱子数量或箱号。
+    /// 本方法复用内部二维利用率策略：同高度分层、最多三种箱型组合和二维候选搜索，
+    /// 不会重新生成箱子数量或箱号。
     /// </summary>
     /// <remarks>
     /// 利用率规划面向“当前仍在货架上的箱子集合”。调用方应在规划前完成箱子的增删；
     /// 每个真实箱子最多使用一次，输出中的箱号和 Order 与当前集合保持对应。
     /// 二维排布阶段使用箱型类别代表尺寸，而不是单箱原始尺寸。
     /// </remarks>
-    public StackPlanResult GenerateBestUtilizationPlan()
+    private StackPlanResult GenerateBestUtilizationPlan()
     {
         _logger.Log(
             PlannerLogLevel.Debug,
@@ -2607,12 +2541,6 @@ public sealed class StackPlanner
                         .Add(tail);
                     if (!_reusableUtilizationPlacements.ContainsKey(removedKey))
                         _reusableUtilizationPlacements[removedKey] = new List<BoxPlacement> { tail };
-                    _reusablePlacementTypeDimensions[removedKey] = new BoxDimension
-                    {
-                        LengthMm = removed.LengthMm,
-                        WidthMm = removed.WidthMm,
-                        HeightMm = removed.HeightMm,
-                    };
                 }
             }
         }
@@ -2648,7 +2576,6 @@ public sealed class StackPlanner
             Message = message,
             Boxes = GetBoxes(),
             Plan = CurrentPlan,
-            ReusablePlacements = ExportReusablePlacements(),
         };
 
     private UtilizationMutationResult MutationFailure(string message)
@@ -2658,76 +2585,7 @@ public sealed class StackPlanner
             Message = message,
             Boxes = GetBoxes(),
             Plan = CurrentPlan,
-            ReusablePlacements = ExportReusablePlacements(),
         };
-
-    private IReadOnlyList<ReusablePlacementSet> ExportReusablePlacements()
-        => _reusableUtilizationPlacements
-            .Where(entry => entry.Value.Count > 0)
-            .Select(entry => new ReusablePlacementSet
-            {
-                Dimension = ResolveReusableDimensionByTypeId(entry.Key),
-                Placements = entry.Value.Select(ClonePlacement).ToArray(),
-            })
-            .ToArray();
-
-    private BoxDimension ResolveReusableDimensionByTypeId(string typeId)
-    {
-        var definition = BoxTypeClassifier.GetDefinitions()
-            .FirstOrDefault(item => string.Equals(item.TypeId, typeId, StringComparison.Ordinal));
-        if (definition is not null)
-        {
-            return new BoxDimension
-            {
-                LengthMm = definition.RepLengthMm,
-                WidthMm = definition.RepDepthMm,
-                HeightMm = definition.RepHeightMm,
-            };
-        }
-
-        if (_reusablePlacementTypeDimensions.TryGetValue(typeId, out var dimension))
-        {
-            return new BoxDimension
-            {
-                LengthMm = dimension.LengthMm,
-                WidthMm = dimension.WidthMm,
-                HeightMm = dimension.HeightMm,
-            };
-        }
-
-        if (TryParseDimensionKey(typeId, out var parsed))
-            return parsed;
-
-        return new BoxDimension
-        {
-            LengthMm = 0,
-            WidthMm = 0,
-            HeightMm = 0,
-        };
-    }
-
-    private static bool TryParseDimensionKey(string key, out BoxDimension dimension)
-    {
-        dimension = default!;
-        var values = key.Split('x');
-        if (values.Length != 3)
-            return false;
-
-        if (!double.TryParse(values[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var length)
-            || !double.TryParse(values[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var width)
-            || !double.TryParse(values[2], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var height))
-        {
-            return false;
-        }
-
-        dimension = new BoxDimension
-        {
-            LengthMm = length,
-            WidthMm = width,
-            HeightMm = height,
-        };
-        return true;
-    }
 
     private void AssignOrders(bool preserveExistingOnShelf = false)
     {

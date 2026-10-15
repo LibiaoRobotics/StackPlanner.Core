@@ -28,20 +28,12 @@ internal static class BoxTypeClassifier
             throw new ArgumentOutOfRangeException(nameof(toleranceMm), "容差参数必须是大于等于 0 的有限数值。");
 
         var configuredTypes = LoadConfiguredTypes();
-        var accumulators = configuredTypes
-            .ToDictionary(
-                type => type.TypeId,
-                type => new ClusterAccumulator(type.TypeId, type.RepLengthMm, type.RepHeightMm, type.RepDepthMm),
-                StringComparer.Ordinal);
-        var unrecognized = new ClusterAccumulator(UnrecognizedTypeId, 0, 0, 0);
-        var invalid = new ClusterAccumulator(InvalidTypeId, 0, 0, 0);
         var assignments = new List<BoxTypeAssignment>(boxes.Count);
 
         foreach (var box in boxes)
         {
             if (IsInvalidBox(box))
             {
-                invalid.Add(box);
                 assignments.Add(CreateAssignment(box, InvalidTypeId));
                 continue;
             }
@@ -49,41 +41,18 @@ internal static class BoxTypeClassifier
             var matched = FindBestMatchedType(box, configuredTypes, toleranceMm);
             if (matched is null)
             {
-                unrecognized.Add(box);
                 assignments.Add(CreateAssignment(box, UnrecognizedTypeId));
                 continue;
             }
 
-            accumulators[matched.TypeId].Add(box);
-            assignments.Add(CreateAssignment(
-                box,
-                matched.TypeId,
-                (matched.RepLengthMm, matched.RepHeightMm, matched.RepDepthMm)));
+            assignments.Add(CreateAssignment(box, matched.TypeId));
         }
-
-        var clusters = new List<BoxTypeClusterSummary>();
-        foreach (var configured in configuredTypes)
-        {
-            var accumulator = accumulators[configured.TypeId];
-            if (accumulator.Count > 0)
-                clusters.Add(accumulator.ToSummary());
-        }
-
-        if (unrecognized.Count > 0)
-            clusters.Add(unrecognized.ToSummary());
-        if (invalid.Count > 0)
-            clusters.Add(invalid.ToSummary());
 
         return new BoxTypeClassificationResult
         {
-            ToleranceMm = toleranceMm,
-            TotalBoxes = boxes.Count,
-            ClusterCount = clusters.Count,
-            Clusters = clusters,
             Assignments = assignments
                 .OrderBy(item => item.BoxNumber, StringComparer.Ordinal)
                 .ToArray(),
-            GeneratedAtUtc = DateTimeOffset.UtcNow,
         };
     }
 
@@ -117,8 +86,7 @@ internal static class BoxTypeClassifier
 
     private static BoxTypeAssignment CreateAssignment(
         InventoryBoxRecord box,
-        string typeId,
-        (double LengthMm, double HeightMm, double DepthMm)? baseSize = null)
+        string typeId)
         => new()
         {
             BoxNumber = box.BoxNumber,
@@ -127,10 +95,6 @@ internal static class BoxTypeClassifier
             HeightMm = box.HeightMm,
             DepthMm = box.DepthMm,
             WeightKg = box.WeightKg,
-            BaseLengthMm = baseSize?.LengthMm,
-            BaseHeightMm = baseSize?.HeightMm,
-            BaseDepthMm = baseSize?.DepthMm,
-            Source = box.Source,
         };
 
     private static bool IsInvalidBox(InventoryBoxRecord box)
@@ -336,62 +300,6 @@ internal static class BoxTypeClassifier
         double right2,
         double right3)
         => Math.Abs(left1 - right1) + Math.Abs(left2 - right2) + Math.Abs(left3 - right3);
-
-    private sealed class ClusterAccumulator
-    {
-        private readonly string _typeId;
-        private readonly double _repLengthMm;
-        private readonly double _repHeightMm;
-        private readonly double _repDepthMm;
-        private double _weightSum;
-        private double _weightMin;
-        private double _weightMax;
-
-        public ClusterAccumulator(string typeId, double repLengthMm, double repHeightMm, double repDepthMm)
-        {
-            _typeId = typeId;
-            _repLengthMm = repLengthMm;
-            _repHeightMm = repHeightMm;
-            _repDepthMm = repDepthMm;
-        }
-
-        public int Count { get; private set; }
-
-        public void Add(InventoryBoxRecord item)
-        {
-            if (Count == 0)
-            {
-                _weightMin = item.WeightKg;
-                _weightMax = item.WeightKg;
-            }
-            else
-            {
-                _weightMin = Math.Min(_weightMin, item.WeightKg);
-                _weightMax = Math.Max(_weightMax, item.WeightKg);
-            }
-
-            Count++;
-            _weightSum += item.WeightKg;
-        }
-
-        public BoxTypeClusterSummary ToSummary()
-        {
-            if (Count <= 0)
-                throw new InvalidOperationException("分类簇为空，不能生成摘要。");
-
-            return new BoxTypeClusterSummary
-            {
-                TypeId = _typeId,
-                Count = Count,
-                RepLengthMm = Math.Round(_repLengthMm, 3),
-                RepHeightMm = Math.Round(_repHeightMm, 3),
-                RepDepthMm = Math.Round(_repDepthMm, 3),
-                WeightAvgKg = Math.Round(_weightSum / Count, 3),
-                WeightMinKg = Math.Round(_weightMin, 3),
-                WeightMaxKg = Math.Round(_weightMax, 3),
-            };
-        }
-    }
 
     private sealed record ConfiguredType(
         string TypeId,
