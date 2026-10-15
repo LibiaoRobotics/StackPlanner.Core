@@ -101,58 +101,16 @@ public sealed class StackPlanner
             throw new ArgumentException("托盘边界必须为有限数值，且最大值必须大于最小值。");
     }
 
-    /// <summary>当前规划器使用的托盘 X 最小边界，单位为 mm。</summary>
-    public double PalletXMin => _palletXMinMm;
-    /// <summary>当前规划器使用的托盘 X 最大边界，单位为 mm。</summary>
-    public double PalletXMax => _palletXMaxMm;
-    /// <summary>当前规划器使用的托盘 Y 最小边界，单位为 mm。</summary>
-    public double PalletYMin => _palletYMinMm;
-    /// <summary>当前规划器使用的托盘 Y 最大边界，单位为 mm。</summary>
-    public double PalletYMax => _palletYMaxMm;
-    /// <summary>当前日志配置。</summary>
-    public PlannerLogOptions CurrentLogOptions => _logger.CurrentOptions;
-
     /// <summary>更新日志配置。</summary>
     public void ConfigureLogging(PlannerLogOptions? options) => _logger.Configure(options);
 
     /// <summary>获取最近日志（按时间升序）。</summary>
     public IReadOnlyList<PlannerLogEntry> GetRecentLogs(int maxCount = 200) => _logger.GetRecent(maxCount);
 
-    /// <summary>清空当前日志缓冲。</summary>
-    public void ClearLogs() => _logger.Clear();
-
-    /// <summary>
-    /// 设置当前任务的托盘边界。必须在首次成功生成规划前调用，规划完成后不能修改。
-    /// </summary>
-    /// <param name="palletXMinMm">托盘 X 最小边界，单位为 mm。</param>
-    /// <param name="palletXMaxMm">托盘 X 最大边界，单位为 mm。</param>
-    /// <param name="palletYMinMm">托盘 Y 最小边界，单位为 mm。</param>
-    /// <param name="palletYMaxMm">托盘 Y 最大边界，单位为 mm。</param>
-    /// <exception cref="InvalidOperationException">规划已经生成，不能修改托盘尺寸。</exception>
-    /// <exception cref="ArgumentException">托盘边界不是有限值或最大值不大于最小值。</exception>
-    public void SetPalletDimensions(
-        double palletXMinMm,
-        double palletXMaxMm,
-        double palletYMinMm,
-        double palletYMaxMm)
-    {
-        if (_hasGeneratedPlan)
-            throw new InvalidOperationException("规划已经生成，不能修改托盘尺寸。");
-
-        ValidatePalletDimensions(palletXMinMm, palletXMaxMm, palletYMinMm, palletYMaxMm);
-        _palletXMinMm = palletXMinMm;
-        _palletXMaxMm = palletXMaxMm;
-        _palletYMinMm = palletYMinMm;
-        _palletYMaxMm = palletYMaxMm;
-    }
-
     /// <summary>
     /// 获取当前箱子集合的副本。调用方修改返回对象不会影响 DLL 内部状态。
     /// </summary>
     public IReadOnlyList<Box> GetBoxes() => _group.Boxes.Select(CloneBox).ToArray();
-
-    /// <summary>获取当前待堆垛库存记录副本。</summary>
-    public IReadOnlyList<InventoryBoxRecord> GetInventoryBoxes() => _inventoryDatabase.GetAll();
 
     /// <summary>
     /// 批量写入待堆垛库存。
@@ -181,16 +139,6 @@ public sealed class StackPlanner
                 detail: ex.Message);
             throw;
         }
-    }
-
-    /// <summary>清空待堆垛库存。</summary>
-    public void ClearInventoryBoxes()
-    {
-        _inventoryDatabase.Clear();
-        _logger.Log(
-            PlannerLogLevel.Info,
-            "inventory.cleared",
-            "库存已清空。");
     }
 
     /// <summary>
@@ -463,40 +411,6 @@ public sealed class StackPlanner
         };
     }
 
-    /// <summary>生成当前箱子集合和规划数据的不可变快照。</summary>
-    public PlannerSnapshot CreateSnapshot() => new()
-    {
-        Revision = 0,
-        UpdatedAtUtc = DateTimeOffset.UtcNow,
-        Boxes = GetBoxes(),
-        Plan = CurrentPlan,
-        ReusablePlacements = ExportReusablePlacements(),
-    };
-
-    /// <summary>将当前完整状态原子发布到本地快照文件。</summary>
-    public PlannerSnapshot SaveSnapshot(string filePath)
-    {
-        try
-        {
-            var snapshot = PlannerSnapshotStore.Save(filePath, CreateSnapshot());
-            _logger.Log(
-                PlannerLogLevel.Info,
-                "snapshot.saved",
-                "快照写入完成。",
-                detail: $"FilePath={filePath}, Revision={snapshot.Revision}, Boxes={snapshot.Boxes.Count}, Placements={snapshot.Plan.Placements.Count}");
-            return snapshot;
-        }
-        catch (Exception ex)
-        {
-            _logger.Log(
-                PlannerLogLevel.Error,
-                "snapshot.save.failed",
-                "快照写入失败。",
-                detail: $"FilePath={filePath}, Error={ex.Message}");
-            throw;
-        }
-    }
-
     /// <summary>
     /// 从完整快照恢复 Core 状态。恢复前会校验箱号、箱子属性和规划引用关系。
     /// </summary>
@@ -561,97 +475,6 @@ public sealed class StackPlanner
             PlanningResult = snapshot.Plan.PlanningResult,
         };
         _hasGeneratedPlan = placements.Length > 0 || boxes.Length == 0;
-    }
-
-    /// <summary>从本地快照文件恢复 Core 状态。</summary>
-    public void LoadSnapshot(string filePath)
-    {
-        try
-        {
-            var snapshot = PlannerSnapshotStore.Load(filePath);
-            RestoreSnapshot(snapshot);
-            _logger.Log(
-                PlannerLogLevel.Info,
-                "snapshot.loaded",
-                "快照读取并恢复完成。",
-                detail: $"FilePath={filePath}, Revision={snapshot.Revision}, Boxes={snapshot.Boxes.Count}, Placements={snapshot.Plan.Placements.Count}");
-        }
-        catch (Exception ex)
-        {
-            _logger.Log(
-                PlannerLogLevel.Error,
-                "snapshot.load.failed",
-                "快照读取或恢复失败。",
-                detail: $"FilePath={filePath}, Error={ex.Message}");
-            throw;
-        }
-    }
-
-    /// <summary>
-    /// 增加一个新箱子。
-    /// 新增箱子必须处于 OnShelf 状态，重复箱号不会覆盖已有箱子。
-    /// </summary>
-    /// <param name="box">待加入的箱子；规划器会复制该对象。</param>
-    /// <exception cref="ArgumentNullException">box 为 null。</exception>
-    /// <exception cref="ArgumentException">箱号、尺寸或重量不合法。</exception>
-    /// <exception cref="InvalidOperationException">箱号重复或初始状态不是 OnShelf。</exception>
-    public void AddBox(Box box)
-    {
-        ArgumentNullException.ThrowIfNull(box);
-        ValidateBox(box);
-        if (_group.MutableBoxes.Any(x => string.Equals(x.BoxNumber, box.BoxNumber, StringComparison.Ordinal)))
-            throw new InvalidOperationException($"箱号已存在: {box.BoxNumber}");
-        if (box.Status != BoxStatus.OnShelf)
-            throw new InvalidOperationException("新增箱子必须处于 OnShelf 状态。");
-        var added = CloneBox(box);
-        RegisterReplacementBox(added);
-        _group.MutableBoxes.Add(added);
-    }
-
-    /// <summary>
-    /// 批量增加箱子。方法先完整校验输入，任何一个箱子不合法时都不会加入部分数据。
-    /// </summary>
-    /// <param name="boxes">待加入的独立箱子集合。</param>
-    public void AddBoxes(IEnumerable<Box> boxes)
-    {
-        ArgumentNullException.ThrowIfNull(boxes);
-        var incoming = boxes.Select(CloneBox).ToArray();
-        var numbers = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var box in incoming)
-        {
-            ValidateBox(box);
-            if (box.Status != BoxStatus.OnShelf)
-                throw new InvalidOperationException("新增箱子必须处于 OnShelf 状态。");
-            if (!numbers.Add(box.BoxNumber) || _group.MutableBoxes.Any(x => x.BoxNumber == box.BoxNumber))
-                throw new InvalidOperationException($"箱号已存在: {box.BoxNumber}");
-        }
-        foreach (var box in incoming)
-        {
-            RegisterReplacementBox(box);
-            _group.MutableBoxes.Add(box);
-        }
-    }
-
-    /// <summary>
-    /// 删除指定箱子并压缩后续箱子的顺序。
-    /// Stacking 和 StackingSucceeded 状态的箱子不能删除。
-    /// </summary>
-    /// <param name="boxNumber">待删除的唯一箱号。</param>
-    /// <returns>成功删除返回 true；箱号不存在或状态受保护时返回 false。</returns>
-    public bool RemoveBox(string boxNumber)
-    {
-        var box = FindBox(boxNumber);
-        if (box is null || box.Status is BoxStatus.StackingSucceeded or BoxStatus.Stacking)
-            return false;
-        int removedOrder = box.Order;
-        string typeKey = SameSpecTypeId(box);
-        _group.MutableBoxes.Remove(box);
-        foreach (var following in _group.MutableBoxes.Where(x => x.Order > removedOrder))
-            following.Order--;
-        _pendingReplacementCounts[typeKey] = _pendingReplacementCounts.GetValueOrDefault(typeKey) + 1;
-        _succeeded.Remove(boxNumber);
-        _lastPlacements.Remove(boxNumber);
-        return true;
     }
 
     /// <summary>
@@ -758,21 +581,6 @@ public sealed class StackPlanner
             WeightKg = replacement.WeightKg,
             Status = BoxStatus.OnShelf,
         };
-    }
-
-    /// <summary>
-    /// 清空整个堆垛任务，包括成功箱真实占用、最近方案和所有箱子状态。
-    /// 这是显式的整垛重置操作，清空后可以在同一个实例中开始新任务。
-    /// </summary>
-    public void ClearBoxes()
-    {
-        _group.MutableBoxes.Clear();
-        _succeeded.Clear();
-        _lastPlacements.Clear();
-        _pendingReplacementCounts.Clear();
-        _pendingReplacementBoxes.Clear();
-        _lastPlan = new StackPlanResult { Placements = Array.Empty<BoxPlacement>(), PlanningResult = true };
-        _hasGeneratedPlan = false;
     }
 
     /// <summary>
@@ -1751,55 +1559,6 @@ public sealed class StackPlanner
                 .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
                 .ToArray());
         return true;
-    }
-
-    /// <summary>
-    /// 用给定的真实箱子集合重建 Core 内存并执行有限箱子利用率规划。
-    /// </summary>
-    public StackPlanResult GenerateBestUtilizationPlanFromBoxes(IEnumerable<Box> boxes)
-    {
-        ArgumentNullException.ThrowIfNull(boxes);
-        ClearBoxes();
-        AddBoxes(boxes);
-        return GenerateBestUtilizationPlan();
-    }
-
-    /// <summary>
-    /// 在给定快照上应用利用率加减箱变更，并返回最终结果。
-    /// </summary>
-    public UtilizationMutationResult ApplyUtilizationMutation(
-        PlannerSnapshot snapshot,
-        IEnumerable<string> removedBoxNumbers,
-        IEnumerable<Box> addedBoxes)
-    {
-        ArgumentNullException.ThrowIfNull(snapshot);
-        ArgumentNullException.ThrowIfNull(removedBoxNumbers);
-        ArgumentNullException.ThrowIfNull(addedBoxes);
-
-        RestoreSnapshot(snapshot);
-
-        UtilizationMutationResult? result = null;
-        foreach (string boxNumber in removedBoxNumbers)
-        {
-            result = RemoveAndAddSameSpecBox(new Box
-            {
-                BoxNumber = boxNumber,
-            });
-            if (!result.Succeeded)
-                break;
-        }
-
-        if (result is null || result.Succeeded)
-        {
-            foreach (var box in addedBoxes)
-            {
-                result = AddBoxWithoutReplanning(box);
-                if (!result.Succeeded)
-                    break;
-            }
-        }
-
-        return result ?? MutationSuccess("没有需要执行的加减箱操作。");
     }
 
     private DirectStackResult? FindBestLayerStack(
@@ -2803,16 +2562,6 @@ public sealed class StackPlanner
         && a.Right + StackBoxGapMm / 2 > b.Left - StackBoxGapMm / 2 + Epsilon
         && a.Bottom - StackBoxGapMm / 2 < b.Top + StackBoxGapMm / 2 - Epsilon
         && a.Top + StackBoxGapMm / 2 > b.Bottom - StackBoxGapMm / 2 + Epsilon;
-    private double CalculateLayerUtilization(int layer)
-    {
-        double palletArea = (_palletXMaxMm - _palletXMinMm) * (_palletYMaxMm - _palletYMinMm);
-        if (palletArea <= Epsilon) return 0;
-        return _lastPlan.Placements
-            .Where(x => x.LayerIndex == layer)
-            .Select(x => ToPlacedBox(FindBox(x.BoxNumber)!, x, false))
-            .Sum(x => x.Width * x.Length) / palletArea;
-    }
-
     private static BoxDimension ToDimension(Box box) => new()
     {
         LengthMm = box.LengthMm,
@@ -2897,51 +2646,6 @@ public sealed class StackPlanner
         if (items.Length <= maxItems)
             return string.Join(",", items);
         return string.Join(",", items.Take(maxItems)) + ",...";
-    }
-
-    private StackPlanner CreatePlanningCopy()
-    {
-        var copy = new StackPlanner(_palletXMinMm, _palletXMaxMm, _palletYMinMm, _palletYMaxMm);
-        copy.AddBoxes(_group.MutableBoxes.Select(x => CloneBox(x) with { Status = BoxStatus.OnShelf }));
-        var generated = copy.GeneratePlan();
-
-        foreach (var box in _group.MutableBoxes.Where(x => x.Status != BoxStatus.OnShelf))
-        {
-            BoxPlacement? placement = null;
-            if (_succeeded.TryGetValue(box.BoxNumber, out var fixedPlacement))
-                placement = fixedPlacement.Placement;
-            else if (_lastPlacements.TryGetValue(box.BoxNumber, out var lastPlacement))
-                placement = lastPlacement;
-            else
-                placement = generated.Placements.FirstOrDefault(x => x.BoxNumber == box.BoxNumber);
-
-            if (placement is null)
-                throw new InvalidOperationException($"箱子 {box.BoxNumber} 没有可恢复的规划位置。");
-
-            copy.UpdateBoxStatus(box.BoxNumber, box.Status, placement);
-        }
-
-        return copy;
-    }
-
-    /// <summary>记录新增箱子是否匹配待补位的同 TypeId 删除箱。</summary>
-    private void RegisterReplacementBox(Box box)
-    {
-        string typeKey = SameSpecTypeId(box);
-        if (!_pendingReplacementCounts.TryGetValue(typeKey, out int pendingCount) || pendingCount <= 0)
-            return;
-
-        if (pendingCount == 1)
-            _pendingReplacementCounts.Remove(typeKey);
-        else
-            _pendingReplacementCounts[typeKey] = pendingCount - 1;
-
-        if (!_pendingReplacementBoxes.TryGetValue(typeKey, out var boxNumbers))
-        {
-            boxNumbers = new HashSet<string>(StringComparer.Ordinal);
-            _pendingReplacementBoxes[typeKey] = boxNumbers;
-        }
-        boxNumbers.Add(box.BoxNumber);
     }
 
     /// <summary>
@@ -3616,127 +3320,6 @@ public sealed class StackPlanner
     }
 
     /// <summary>
-    /// 使用代表箱子在空托盘上生成一个确定性的底层布局模板。
-    /// 模板只保存同层相对位置，实际套用时仍需重新检查当前支撑面。
-    /// </summary>
-    private LayerTemplate BuildLayerTemplate(Box box)
-    {
-        var occupied = new List<PlacedBox>();
-        var slots = new List<LayerTemplateSlot>();
-        while (true)
-        {
-            var candidate = GenerateCandidates(box, occupied)
-                .FirstOrDefault(x => x.Placement.LayerIndex == 0 && x.Candidate.BaseZ <= Epsilon);
-            if (candidate is null) break;
-
-            var placed = ToPlacedBox(box, candidate.Placement, false);
-            if (!Fits(placed, occupied)) break;
-            occupied.Add(placed);
-            slots.Add(new LayerTemplateSlot(
-                candidate.Placement.Xmm,
-                candidate.Placement.Ymm,
-                candidate.Placement.OrientationDeg));
-        }
-
-        if (slots.Count == 0)
-            return new LayerTemplate(Array.Empty<LayerTemplateSlot>());
-
-        var anchor = slots[0];
-        return new LayerTemplate(slots.Select(x => new LayerTemplateSlot(
-            x.RelativeX - anchor.RelativeX,
-            x.RelativeY - anchor.RelativeY,
-            x.OrientationDeg)).ToArray());
-    }
-
-    /// <summary>
-    /// 将一层模板绑定到当前候选箱子，并批量生成同箱型箱子的搜索状态。
-    /// 任一槽位不合法时不提交部分结果，由普通搜索分支继续处理。
-    /// </summary>
-    private SearchState? TryApplyLayerTemplate(
-        SearchState state,
-        Box anchorBox,
-        CandidatePlacement anchor,
-        LayerTemplate template,
-        IReadOnlyList<Box> remaining)
-    {
-        if (template.Slots.Count < 2)
-            return null;
-        if (template.Slots[0].OrientationDeg != anchor.Placement.OrientationDeg)
-            return null;
-
-        var sameType = remaining
-            .Where(x => string.Equals(BoxTypeKey(x), BoxTypeKey(anchorBox), StringComparison.Ordinal))
-            .OrderBy(x => x.Order)
-            .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
-            .Take(template.Slots.Count - 1)
-            .ToArray();
-        if (sameType.Length == 0)
-            return null;
-
-        var occupied = state.Occupied.ToList();
-        var placements = new Dictionary<string, BoxPlacement>(state.Placements, StringComparer.Ordinal)
-        {
-            [anchorBox.BoxNumber] = anchor.Placement,
-        };
-        occupied.Add(ToPlacedBox(anchorBox, anchor.Placement, false));
-        var usedNumbers = new HashSet<string>(StringComparer.Ordinal) { anchorBox.BoxNumber };
-
-        for (int index = 0; index < sameType.Length; index++)
-        {
-            var box = sameType[index];
-            var slot = template.Slots[index + 1];
-            var candidate = new Candidate(
-                anchor.Placement.Xmm + slot.RelativeX,
-                anchor.Placement.Ymm + slot.RelativeY,
-                anchor.Candidate.BaseZ,
-                slot.OrientationDeg == 0 ? box.WidthMm : box.LengthMm,
-                slot.OrientationDeg == 0 ? box.LengthMm : box.WidthMm,
-                box.HeightMm,
-                slot.OrientationDeg);
-
-            if (!InsidePallet(candidate) || Collides(candidate, occupied))
-                return null;
-
-            var supports = Supporting(candidate, occupied);
-            if (candidate.BaseZ > Epsilon
-                && (supports.Count == 0 || !HasStableSupport(candidate, supports)))
-                return null;
-
-            int layer = candidate.BaseZ <= Epsilon
-                ? 0
-                : supports.Max(x => x.Placement.LayerIndex) + 1;
-            if (layer != anchor.Placement.LayerIndex)
-                return null;
-
-            var placement = new BoxPlacement
-            {
-                Order = box.Order,
-                BoxNumber = box.BoxNumber,
-                Xmm = Round(candidate.X),
-                Ymm = Round(candidate.Y),
-                Zmm = Round(PlaceFloorZMm - candidate.BaseZ - box.HeightMm),
-                OrientationDeg = slot.OrientationDeg,
-                LayerIndex = layer,
-            };
-            var placed = ToPlacedBox(box, placement, false);
-            if (!Fits(placed, occupied))
-                return null;
-
-            occupied.Add(placed);
-            placements[box.BoxNumber] = placement;
-            usedNumbers.Add(box.BoxNumber);
-        }
-
-        var nextRemaining = remaining.Where(x => !usedNumbers.Contains(x.BoxNumber)).ToArray();
-        return new SearchState(
-            nextRemaining,
-            occupied.ToArray(),
-            placements,
-            anchor.Placement.LayerIndex,
-            BoxTypeKey(anchorBox));
-    }
-
-    /// <summary>
     /// 将搜索结果中的 OnShelf 箱子恢复为加入时分配的顺序号，
     /// 同时避开非 OnShelf 箱子已经锁定的顺序号。
     /// </summary>
@@ -3767,83 +3350,6 @@ public sealed class StackPlanner
         return state with { Placements = replacements };
     }
 
-    /// <summary>
-    /// 选择当前层的下一个箱子。只有当前最低可用层没有任何剩余箱子可放时，
-    /// 才允许搜索进入更高层；当前层优先继续放置同一箱型。
-    /// </summary>
-    private BoxChoice? SelectNextBox(SearchState state)
-    {
-        // 候选几何只由箱子尺寸、朝向和当前占用决定，与箱号及 Order 无关。
-        // 相同箱型只为确定性代表箱生成一次候选，避免 128 个相同箱子在每个搜索状态
-        // 中重复执行完全相同的边界、碰撞和支撑计算。
-        var candidatesByBox = state.Remaining
-            .GroupBy(BoxTypeKey, StringComparer.Ordinal)
-            .Select(group =>
-            {
-                var box = group
-                    .OrderBy(x => x.Order)
-                    .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
-                    .First();
-                return new SearchBoxCandidates(box, GenerateCandidates(box, state.Occupied));
-            })
-            .ToArray();
-        int currentLayer = candidatesByBox
-            .SelectMany(x => x.Candidates)
-            .Select(x => x.Placement.LayerIndex)
-            .DefaultIfEmpty(int.MaxValue)
-            .Min();
-
-        var currentLayerBoxes = candidatesByBox
-            .Select(x => new SearchBoxCandidates(x.Box,
-                x.Candidates.Where(c => c.Placement.LayerIndex == currentLayer).ToArray()))
-            .Where(x => x.Candidates.Count > 0)
-            .ToArray();
-        if (currentLayerBoxes.Length == 0)
-            return null;
-
-        string? typeKey = state.PreferredLayer == currentLayer
-            ? state.PreferredTypeKey
-            : GetOccupiedTypeKey(state.Occupied, currentLayer);
-        var preferredTypeBoxes = string.IsNullOrEmpty(typeKey)
-            ? Array.Empty<SearchBoxCandidates>()
-            : currentLayerBoxes.Where(x => BoxTypeKey(x.Box) == typeKey).ToArray();
-        var selectable = preferredTypeBoxes.Length > 0 ? preferredTypeBoxes : currentLayerBoxes;
-
-        var selected = selectable
-            .GroupBy(x => BoxTypeKey(x.Box), StringComparer.Ordinal)
-            // 当前最低层优先放底面积最大的箱型，避免数量多的小箱子抢占底层。
-            .OrderByDescending(group => group.Max(x => BoxBaseArea(x.Box)))
-            .ThenByDescending(group => group.Count())
-            .ThenByDescending(group => group.Sum(x => x.Candidates.Count))
-            .ThenBy(group => group.Key, StringComparer.Ordinal)
-            .First()
-            .OrderBy(x => x.Candidates.Count)
-            .ThenByDescending(x => BoxBaseArea(x.Box))
-            .ThenByDescending(x => BoxVolume(x.Box))
-            .ThenByDescending(x => x.Box.HeightMm)
-            .ThenBy(x => x.Box.BoxNumber, StringComparer.Ordinal)
-            .First();
-
-        return new BoxChoice(selected.Box, selected.Candidates);
-    }
-
-    private string? GetOccupiedTypeKey(IReadOnlyList<PlacedBox> occupied, int layer)
-    {
-        if (layer < 0)
-            return null;
-
-        return occupied
-            .Where(x => x.Placement.LayerIndex == layer)
-            .Select(x => FindBox(x.Placement.BoxNumber))
-            .Where(x => x is not null)
-            .Select(x => BoxTypeKey(x!))
-            .GroupBy(x => x, StringComparer.Ordinal)
-            .OrderByDescending(x => x.Count())
-            .ThenBy(x => x.Key, StringComparer.Ordinal)
-            .Select(x => x.Key)
-            .FirstOrDefault();
-    }
-
     private static string SameSpecTypeId(Box box)
         => SameSpecTypeId(box.LengthMm, box.WidthMm, box.HeightMm);
 
@@ -3870,22 +3376,6 @@ public sealed class StackPlanner
         return string.Join("x", first.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
             second.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
             box.Height.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
-    }
-
-    private static int SearchPlacedCount(SearchState state) => state.Placements.Count;
-    private static int SearchUpperBound(SearchState state) => state.Placements.Count + state.Remaining.Count;
-    private static int SearchMaxLayer(SearchState state) => state.Occupied.Count == 0 ? 0 : state.Occupied.Max(x => x.Placement.LayerIndex);
-    private static double SearchMaxTopZ(SearchState state) => state.Occupied.Count == 0 ? 0 : state.Occupied.Max(x => x.TopZ);
-    private static double SearchLargeBoxLowLayerScore(SearchState state) => state.Occupied.Sum(x =>
-        BoxBaseAreaFromPlaced(x) / (1 + x.Placement.LayerIndex));
-    private static double SearchBoundingArea(SearchState state)
-    {
-        if (state.Occupied.Count == 0) return 0;
-        double left = state.Occupied.Min(x => x.Left);
-        double right = state.Occupied.Max(x => x.Right);
-        double bottom = state.Occupied.Min(x => x.Bottom);
-        double top = state.Occupied.Max(x => x.Top);
-        return (right - left) * (top - bottom);
     }
 
     private int GetSearchLayer(SearchState state, SearchState previous)
@@ -3981,18 +3471,8 @@ public sealed class StackPlanner
             x.Ymm.ToString("R", System.Globalization.CultureInfo.InvariantCulture), x.Zmm.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
             x.OrientationDeg, x.LayerIndex)));
 
-    private static bool IsBetterSearchState(SearchState candidate, SearchState current) =>
-        SearchPlacedCount(candidate) > SearchPlacedCount(current)
-        || SearchPlacedCount(candidate) == SearchPlacedCount(current)
-        && (SearchMaxLayer(candidate) < SearchMaxLayer(current)
-            || SearchMaxLayer(candidate) == SearchMaxLayer(current) && SearchMaxTopZ(candidate) < SearchMaxTopZ(current)
-            || SearchMaxLayer(candidate) == SearchMaxLayer(current) && SearchMaxTopZ(candidate).Equals(SearchMaxTopZ(current))
-            && SearchLargeBoxLowLayerScore(candidate) > SearchLargeBoxLowLayerScore(current));
-
     private static double BoxBaseArea(Box box) => box.LengthMm * box.WidthMm;
     private static double BoxVolume(Box box) => BoxBaseArea(box) * box.HeightMm;
-    private static double BoxBaseAreaFromPlaced(PlacedBox box) => box.Width * box.Length;
-
     /// <summary>
     /// 将公开的机械 Z 坐标反算为内部箱底高度 BaseZ，供边界、碰撞和支撑计算使用。
     /// </summary>
@@ -4150,17 +3630,11 @@ public sealed class StackPlanner
     private sealed record SearchState(IReadOnlyList<Box> Remaining, IReadOnlyList<PlacedBox> Occupied,
         IReadOnlyDictionary<string, BoxPlacement> Placements, int PreferredLayer, string? PreferredTypeKey);
 
-    private sealed record SearchBoxCandidates(Box Box, IReadOnlyList<CandidatePlacement> Candidates);
-    private sealed record BoxChoice(Box Box, IReadOnlyList<CandidatePlacement> Candidates);
     private sealed record LayerSearchCandidate(
         SearchState State,
         bool SingleType,
         double HeightMm,
         int LayerIndex);
-    /// <summary>同箱型一层布局的相对槽位。</summary>
-    private sealed record LayerTemplateSlot(double RelativeX, double RelativeY, int OrientationDeg);
-    /// <summary>同箱型一层布局模板，不包含具体箱号和绝对高度。</summary>
-    private sealed record LayerTemplate(IReadOnlyList<LayerTemplateSlot> Slots);
     /// <summary>直接二维单层搜索中的一个箱子放置结果。</summary>
     private sealed record DirectLayerPlacement(
         BoxDimension Dimension,
