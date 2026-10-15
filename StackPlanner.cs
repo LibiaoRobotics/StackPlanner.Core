@@ -54,6 +54,8 @@ public sealed class StackPlanner
     private readonly InventoryDatabase _inventoryDatabase = new();
     /// <summary>对外返回的最近一次规划结果。</summary>
     private StackPlanResult _lastPlan = new() { Placements = Array.Empty<BoxPlacement>(), PlanningResult = true };
+    /// <summary>Core 内部日志器。</summary>
+    private readonly StackPlannerLogger _logger = new();
 
     /// <summary>
     /// 使用默认托盘边界创建规划器。
@@ -79,6 +81,12 @@ public sealed class StackPlanner
         _palletXMaxMm = palletXMaxMm;
         _palletYMinMm = palletYMinMm;
         _palletYMaxMm = palletYMaxMm;
+
+        _logger.Log(
+            PlannerLogLevel.Info,
+            "planner.created",
+            "已创建新的堆垛规划器实例。",
+            detail: $"PalletX=[{_palletXMinMm},{_palletXMaxMm}], PalletY=[{_palletYMinMm},{_palletYMaxMm}]");
     }
 
     private static void ValidatePalletDimensions(
@@ -101,6 +109,17 @@ public sealed class StackPlanner
     public double PalletYMin => _palletYMinMm;
     /// <summary>当前规划器使用的托盘 Y 最大边界，单位为 mm。</summary>
     public double PalletYMax => _palletYMaxMm;
+    /// <summary>当前日志配置。</summary>
+    public PlannerLogOptions CurrentLogOptions => _logger.CurrentOptions;
+
+    /// <summary>更新日志配置。</summary>
+    public void ConfigureLogging(PlannerLogOptions? options) => _logger.Configure(options);
+
+    /// <summary>获取最近日志（按时间升序）。</summary>
+    public IReadOnlyList<PlannerLogEntry> GetRecentLogs(int maxCount = 200) => _logger.GetRecent(maxCount);
+
+    /// <summary>清空当前日志缓冲。</summary>
+    public void ClearLogs() => _logger.Clear();
 
     /// <summary>
     /// 设置当前任务的托盘边界。必须在首次成功生成规划前调用，规划完成后不能修改。
@@ -142,10 +161,232 @@ public sealed class StackPlanner
     public InventoryUpsertResult UpsertInventoryBoxes(
         IEnumerable<InventoryBoxRecord> boxes,
         bool replaceAll = false)
-        => _inventoryDatabase.Upsert(boxes, replaceAll);
+    {
+        try
+        {
+            var result = _inventoryDatabase.Upsert(boxes, replaceAll);
+            _logger.Log(
+                PlannerLogLevel.Info,
+                "inventory.upsert",
+                "库存写入完成。",
+                detail: $"ReplaceAll={replaceAll}, Upserted={result.Upserted}, Inserted={result.Inserted}, Updated={result.Updated}, Invalid={result.Invalid}, Total={result.Total}");
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.Log(
+                PlannerLogLevel.Error,
+                "inventory.upsert.failed",
+                "库存写入失败。",
+                detail: ex.Message);
+            throw;
+        }
+    }
 
     /// <summary>清空待堆垛库存。</summary>
-    public void ClearInventoryBoxes() => _inventoryDatabase.Clear();
+    public void ClearInventoryBoxes()
+    {
+        _inventoryDatabase.Clear();
+        _logger.Log(
+            PlannerLogLevel.Info,
+            "inventory.cleared",
+            "库存已清空。");
+    }
+
+    /// <summary>
+    /// 批量写入已成功堆垛数据。
+    /// replaceAll=true 时先清空当前成功堆垛集合，再写入本次数据。
+    /// 已存在成功箱的 Order 视为锁定值，不允许通过增量写入修改。
+    /// </summary>
+    public SucceededPlacementUpsertResult UpsertSucceededPlacements(
+        IEnumerable<SucceededPlacementRecord> records,
+        bool replaceAll = false)
+    {
+        ArgumentNullException.ThrowIfNull(records);
+
+        var request = records.ToArray();
+        _logger.Log(
+            PlannerLogLevel.Info,
+            "succeeded.upsert.begin",
+            "开始批量写入成功堆垛数据。",
+            detail: $"RequestCount={request.Length}, ReplaceAll={replaceAll}");
+
+        int invalid = 0;
+        var valid = new List<SucceededPlacementRecord>(request.Length);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var item in request)
+        {
+            if (!TryNormalizeSucceededPlacement(item, out var normalized))
+            {
+                invalid++;
+                continue;
+            }
+
+            if (!seen.Add(normalized.BoxNumber))
+            {
+                invalid++;
+                continue;
+            }
+
+            if (!replaceAll
+                && _succeeded.TryGetValue(normalized.BoxNumber, out var existing)
+                && existing.Placement.Order != normalized.Placement.Order)
+            {
+                invalid++;
+                continue;
+            }
+
+            valid.Add(normalized);
+        }
+
+        var finalSucceeded = new Dictionary<string, SucceededPlacementRecord>(StringComparer.Ordinal);
+        if (!replaceAll)
+        {
+            foreach (var pair in _succeeded)
+            {
+                var box = FindBox(pair.Key);
+                finalSucceeded[pair.Key] = new SucceededPlacementRecord
+                {
+                    BoxNumber = pair.Key,
+                    LengthMm = box?.LengthMm ?? pair.Value.Length,
+                    WidthMm = box?.WidthMm ?? pair.Value.Width,
+                    HeightMm = box?.HeightMm ?? pair.Value.Height,
+                    WeightKg = box?.WeightKg ?? 0,
+                    Placement = ClonePlacement(pair.Value.Placement),
+                };
+            }
+        }
+
+        foreach (var item in valid)
+            finalSucceeded[item.BoxNumber] = item;
+
+        if (!ValidateSucceededSet(finalSucceeded.Values, out string validationMessage))
+        {
+            _logger.Log(
+                PlannerLogLevel.Warning,
+                "succeeded.upsert.rejected",
+                "成功堆垛集合校验未通过，已拒绝本次写入。",
+                detail: validationMessage);
+            return new SucceededPlacementUpsertResult
+            {
+                Upserted = 0,
+                Inserted = 0,
+                Updated = 0,
+                Invalid = invalid + valid.Count,
+                TotalSucceeded = _succeeded.Count,
+                Message = validationMessage,
+            };
+        }
+
+        var existedSucceeded = _succeeded.Keys.ToHashSet(StringComparer.Ordinal);
+        int inserted = 0;
+        int updated = 0;
+        foreach (var item in valid)
+        {
+            if (existedSucceeded.Contains(item.BoxNumber))
+                updated++;
+            else
+                inserted++;
+        }
+
+        if (replaceAll)
+        {
+            var keep = finalSucceeded.Keys.ToHashSet(StringComparer.Ordinal);
+            for (int index = 0; index < _group.MutableBoxes.Count; index++)
+            {
+                var box = _group.MutableBoxes[index];
+                if (box.Status != BoxStatus.StackingSucceeded || keep.Contains(box.BoxNumber))
+                    continue;
+
+                _group.MutableBoxes[index] = box with
+                {
+                    Status = BoxStatus.OnShelf,
+                    Order = -1,
+                };
+                _lastPlacements.Remove(box.BoxNumber);
+            }
+
+            _succeeded.Clear();
+        }
+
+        foreach (var item in finalSucceeded.Values)
+        {
+            int index = _group.MutableBoxes.FindIndex(x => string.Equals(x.BoxNumber, item.BoxNumber, StringComparison.Ordinal));
+            if (index >= 0)
+            {
+                _group.MutableBoxes[index] = _group.MutableBoxes[index] with
+                {
+                    LengthMm = item.LengthMm,
+                    WidthMm = item.WidthMm,
+                    HeightMm = item.HeightMm,
+                    WeightKg = item.WeightKg,
+                    Status = BoxStatus.StackingSucceeded,
+                    Order = item.Placement.Order,
+                };
+            }
+            else
+            {
+                _group.MutableBoxes.Add(new Box
+                {
+                    BoxNumber = item.BoxNumber,
+                    LengthMm = item.LengthMm,
+                    WidthMm = item.WidthMm,
+                    HeightMm = item.HeightMm,
+                    WeightKg = item.WeightKg,
+                    Status = BoxStatus.StackingSucceeded,
+                    Order = item.Placement.Order,
+                });
+            }
+
+            var placement = ClonePlacement(item.Placement);
+            _lastPlacements[item.BoxNumber] = placement;
+            _succeeded[item.BoxNumber] = new FixedPlacement(
+                placement,
+                item.LengthMm,
+                item.WidthMm,
+                item.HeightMm);
+        }
+
+        var existingNumbers = _group.MutableBoxes
+            .Select(x => x.BoxNumber)
+            .ToHashSet(StringComparer.Ordinal);
+        foreach (var pair in _lastPlacements.Keys.ToArray())
+        {
+            if (!existingNumbers.Contains(pair))
+                _lastPlacements.Remove(pair);
+        }
+
+        var planPlacements = _lastPlacements.Values
+            .Where(item => existingNumbers.Contains(item.BoxNumber))
+            .OrderBy(item => item.Order)
+            .ThenBy(item => item.BoxNumber, StringComparer.Ordinal)
+            .Select(ClonePlacement)
+            .ToArray();
+        _lastPlan = new StackPlanResult
+        {
+            Placements = planPlacements,
+            PlanningResult = planPlacements.Length == _group.MutableBoxes.Count,
+        };
+        _hasGeneratedPlan = planPlacements.Length > 0 || _group.MutableBoxes.Count == 0;
+
+        int upserted = inserted + updated;
+        var result = new SucceededPlacementUpsertResult
+        {
+            Upserted = upserted,
+            Inserted = inserted,
+            Updated = updated,
+            Invalid = invalid,
+            TotalSucceeded = _succeeded.Count,
+            Message = $"成功堆垛写入完成：新增 {inserted}，更新 {updated}，无效 {invalid}，当前成功总数 {_succeeded.Count}。" + validationMessage,
+        };
+
+        _logger.Log(
+            PlannerLogLevel.Info,
+            "succeeded.upsert.completed",
+            "成功堆垛数据写入完成。",
+            detail: $"ReplaceAll={replaceAll}, Upserted={result.Upserted}, Inserted={result.Inserted}, Updated={result.Updated}, Invalid={result.Invalid}, TotalSucceeded={result.TotalSucceeded}");
+        return result;
+    }
 
     /// <summary>
     /// 对库存箱子进行箱型分类。
@@ -234,7 +475,27 @@ public sealed class StackPlanner
 
     /// <summary>将当前完整状态原子发布到本地快照文件。</summary>
     public PlannerSnapshot SaveSnapshot(string filePath)
-        => PlannerSnapshotStore.Save(filePath, CreateSnapshot());
+    {
+        try
+        {
+            var snapshot = PlannerSnapshotStore.Save(filePath, CreateSnapshot());
+            _logger.Log(
+                PlannerLogLevel.Info,
+                "snapshot.saved",
+                "快照写入完成。",
+                detail: $"FilePath={filePath}, Revision={snapshot.Revision}, Boxes={snapshot.Boxes.Count}, Placements={snapshot.Plan.Placements.Count}");
+            return snapshot;
+        }
+        catch (Exception ex)
+        {
+            _logger.Log(
+                PlannerLogLevel.Error,
+                "snapshot.save.failed",
+                "快照写入失败。",
+                detail: $"FilePath={filePath}, Error={ex.Message}");
+            throw;
+        }
+    }
 
     /// <summary>
     /// 从完整快照恢复 Core 状态。恢复前会校验箱号、箱子属性和规划引用关系。
@@ -303,7 +564,28 @@ public sealed class StackPlanner
     }
 
     /// <summary>从本地快照文件恢复 Core 状态。</summary>
-    public void LoadSnapshot(string filePath) => RestoreSnapshot(PlannerSnapshotStore.Load(filePath));
+    public void LoadSnapshot(string filePath)
+    {
+        try
+        {
+            var snapshot = PlannerSnapshotStore.Load(filePath);
+            RestoreSnapshot(snapshot);
+            _logger.Log(
+                PlannerLogLevel.Info,
+                "snapshot.loaded",
+                "快照读取并恢复完成。",
+                detail: $"FilePath={filePath}, Revision={snapshot.Revision}, Boxes={snapshot.Boxes.Count}, Placements={snapshot.Plan.Placements.Count}");
+        }
+        catch (Exception ex)
+        {
+            _logger.Log(
+                PlannerLogLevel.Error,
+                "snapshot.load.failed",
+                "快照读取或恢复失败。",
+                detail: $"FilePath={filePath}, Error={ex.Message}");
+            throw;
+        }
+    }
 
     /// <summary>
     /// 增加一个新箱子。
@@ -542,7 +824,10 @@ public sealed class StackPlanner
             || placement.OrientationDeg is not (0 or 90))
             throw new ArgumentException("箱子放置位置的顺序、层号或朝向不合法。", nameof(placement));
 
-        var placed = ToPlacedBox(box, placement, real: true);
+        var definitionsByTypeId = GetBoxTypeDefinitions()
+            .ToDictionary(item => item.TypeId, item => item, StringComparer.Ordinal);
+        var collisionBox = ToCollisionSizedBox(box, definitionsByTypeId);
+        var placed = ToPlacedBox(collisionBox, placement, real: true);
         if (!InsidePallet(placed))
             throw new ArgumentException($"箱子 {boxNumber} 的固定位置超出托盘范围。", nameof(placement));
 
@@ -563,8 +848,21 @@ public sealed class StackPlanner
     /// <returns>包含所有可规划放置项和整体 PlanningResult 的结果。</returns>
     public StackPlanResult GeneratePlan()
     {
+        _logger.Log(
+            PlannerLogLevel.Info,
+            "plan.generate.begin",
+            "开始执行普通堆垛规划。",
+            detail: $"TotalBoxes={_group.MutableBoxes.Count}, Succeeded={_group.MutableBoxes.Count(x => x.Status == BoxStatus.StackingSucceeded)}");
+
         AssignOrders();
-        var all = _group.MutableBoxes.OrderBy(x => x.Order).ToArray();
+        var definitionsByTypeId = GetBoxTypeDefinitions()
+            .ToDictionary(item => item.TypeId, item => item, StringComparer.Ordinal);
+        var collisionBoxes = BuildCollisionBoxesByNumber(_group.MutableBoxes, definitionsByTypeId);
+        var all = _group.MutableBoxes
+            .OrderBy(x => x.Order)
+            .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
+            .Select(box => collisionBoxes[box.BoxNumber])
+            .ToArray();
         var occupied = new List<PlacedBox>();
         var output = new Dictionary<string, BoxPlacement>(StringComparer.Ordinal);
         bool success = true;
@@ -627,6 +925,11 @@ public sealed class StackPlanner
         foreach (var placement in placements) _lastPlacements[placement.BoxNumber] = ClonePlacement(placement);
         _lastPlan = new StackPlanResult { Placements = placements, PlanningResult = success && placements.Length == all.Length };
         _hasGeneratedPlan = true;
+        _logger.Log(
+            PlannerLogLevel.Info,
+            "plan.generate.completed",
+            "普通堆垛规划完成。",
+            detail: $"PlanningResult={_lastPlan.PlanningResult}, Placements={_lastPlan.Placements.Count}, TotalBoxes={all.Length}");
         return ClonePlan(_lastPlan);
     }
 
@@ -641,6 +944,13 @@ public sealed class StackPlanner
     public UtilizationPlanResult PlanBestUtilization(
         IEnumerable<BoxDimension> dimensions,
         double maxSelectableWeightKg = DefaultMaxSelectableWeightKg)
+        => PlanBestUtilizationCore(dimensions, maxSelectableWeightKg, excludedInventoryBoxNumbers: null);
+
+    private UtilizationPlanResult PlanBestUtilizationCore(
+        IEnumerable<BoxDimension> dimensions,
+        double maxSelectableWeightKg,
+        IReadOnlySet<string>? excludedInventoryBoxNumbers,
+        double maxStackHeightMm = StackMaxHeightMm)
     {
         ArgumentNullException.ThrowIfNull(dimensions);
         if (!double.IsFinite(maxSelectableWeightKg) || maxSelectableWeightKg <= 0)
@@ -669,7 +979,7 @@ public sealed class StackPlanner
             .ToArray();
 
         // 库存上限：每个候选箱型可用的真实库存数量（与选箱使用同一套筛选条件）。
-        var selectableCounts = CountSelectableInventoryByType(maxSelectableWeightKg);
+        var selectableCounts = CountSelectableInventoryByType(maxSelectableWeightKg, excludedInventoryBoxNumbers);
         var typeIdByShape = GetBoxTypeDefinitions()
             .GroupBy(item => ExactDimensionKey(item.RepLengthMm, item.RepDepthMm, item.RepHeightMm), StringComparer.Ordinal)
             .ToDictionary(
@@ -708,7 +1018,7 @@ public sealed class StackPlanner
         if (candidates.Length == 0)
             return EmptyUtilizationPlan("没有尺寸可以形成合法布局。");
 
-        var selected = FindBestLayerStack(candidates, available, caps);
+        var selected = FindBestLayerStack(candidates, available, caps, maxStackHeightMm);
         if (selected is null)
             return EmptyUtilizationPlan("在托盘尺寸和最大堆垛高度限制下，无法满足箱型最小数量约束。", false);
 
@@ -767,14 +1077,48 @@ public sealed class StackPlanner
         IEnumerable<BoxDimension>? dimensions = null,
         double maxSelectableWeightKg = DefaultMaxSelectableWeightKg)
     {
+        var resolvedDimensions = ResolveInventoryUtilizationDimensions(dimensions);
+        _logger.Log(
+            PlannerLogLevel.Info,
+            "utilization.inventory.begin",
+            "开始执行基于库存的利用率规划。",
+            detail: $"MaxSelectableWeightKg={maxSelectableWeightKg:R}");
+        _logger.Log(
+            PlannerLogLevel.Debug,
+            "utilization.inventory.dimensions",
+            "已解析本次利用率规划候选尺寸。",
+            detail: $"CandidateCount={resolvedDimensions.Count}, Candidates={DescribeDimensions(resolvedDimensions)}");
+
         var selection = SelectInventoryBoxesForUtilization(
-            ResolveInventoryUtilizationDimensions(dimensions),
+            resolvedDimensions,
             maxSelectableWeightKg);
         if (!selection.Applied)
+        {
+            _logger.Log(
+                PlannerLogLevel.Warning,
+                "utilization.inventory.selection_failed",
+                "库存选箱阶段失败，未应用到 Core 内存。",
+                detail: selection.Message);
             return selection;
+        }
+
+        _logger.Log(
+            PlannerLogLevel.Debug,
+            "utilization.inventory.selection_applied",
+            "库存选箱阶段已成功应用到 Core 内存。",
+            detail: $"SelectedBoxCount={selection.SelectedBoxCount}, PlannedCounts={DescribePlannedCounts(selection.PlannedCounts)}, LayerCount={selection.Layers.Count}, Utilization={selection.Utilization:R}");
 
         var plan = GenerateBestUtilizationPlan();
-        return new InventoryUtilizationPlanResult
+        if (!plan.PlanningResult)
+        {
+            _logger.Log(
+                PlannerLogLevel.Warning,
+                "utilization.inventory.plan_failed",
+                "库存选箱后真实箱子利用率规划失败。",
+                detail: $"Placements={plan.Placements.Count}, TotalBoxes={_group.MutableBoxes.Count}, OnShelf={_group.MutableBoxes.Count(x => x.Status == BoxStatus.OnShelf)}, Succeeded={_group.MutableBoxes.Count(x => x.Status == BoxStatus.StackingSucceeded)}, StatusSummary={DescribeStatusSummary(_group.MutableBoxes)}");
+        }
+
+        var result = new InventoryUtilizationPlanResult
         {
             PlanningResult = plan.PlanningResult,
             Message = plan.PlanningResult
@@ -786,6 +1130,13 @@ public sealed class StackPlanner
             Applied = true,
             SelectedBoxCount = selection.SelectedBoxCount,
         };
+
+        _logger.Log(
+            result.PlanningResult ? PlannerLogLevel.Info : PlannerLogLevel.Warning,
+            "utilization.inventory.completed",
+            "基于库存的利用率规划完成。",
+            detail: $"PlanningResult={result.PlanningResult}, Applied={result.Applied}, SelectedBoxCount={result.SelectedBoxCount}, Utilization={result.Utilization:R}");
+        return result;
     }
 
     /// <summary>
@@ -827,11 +1178,209 @@ public sealed class StackPlanner
            && item.WeightKg <= maxSelectableWeightKg;
 
     /// <summary>统计库存中各箱型的可选数量（与选箱使用同一筛选条件）。</summary>
-    private Dictionary<string, int> CountSelectableInventoryByType(double maxSelectableWeightKg)
+    private Dictionary<string, int> CountSelectableInventoryByType(
+        double maxSelectableWeightKg,
+        IReadOnlySet<string>? excludedInventoryBoxNumbers = null)
         => ClassifyInventoryBoxTypes().Assignments
             .Where(item => IsSelectableInventoryAssignment(item, maxSelectableWeightKg))
+            .Where(item => excludedInventoryBoxNumbers is null
+                || !excludedInventoryBoxNumbers.Contains(item.BoxNumber))
             .GroupBy(item => item.TypeId, StringComparer.Ordinal)
             .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
+
+    private IReadOnlyList<BoxDimension> ReduceMinimumCountsBySucceeded(
+        IEnumerable<BoxDimension> dimensions,
+        IReadOnlyList<Box> succeededBoxes)
+    {
+        var requested = dimensions.ToArray();
+        if (requested.Length == 0 || succeededBoxes.Count == 0)
+            return requested;
+
+        var candidateKeys = requested
+            .Select(DimensionKey)
+            .ToHashSet(StringComparer.Ordinal);
+        if (candidateKeys.Count == 0)
+            return requested;
+
+        var definitionsByTypeId = GetBoxTypeDefinitions()
+            .ToDictionary(item => item.TypeId, item => item, StringComparer.Ordinal);
+
+        var succeededCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var box in succeededBoxes)
+        {
+            string typeId = BoxTypeClassifier.ClassifyPlanBoxTypeId(
+                box.LengthMm,
+                box.WidthMm,
+                box.HeightMm);
+
+            string key;
+            if (definitionsByTypeId.TryGetValue(typeId, out var definition))
+            {
+                key = DimensionKey(new BoxDimension
+                {
+                    LengthMm = definition.RepLengthMm,
+                    WidthMm = definition.RepDepthMm,
+                    HeightMm = definition.RepHeightMm,
+                });
+            }
+            else
+            {
+                key = DimensionKey(ToDimension(box));
+            }
+
+            if (!candidateKeys.Contains(key))
+                continue;
+
+            succeededCounts[key] = succeededCounts.GetValueOrDefault(key) + 1;
+        }
+
+        return requested
+            .Select(dimension =>
+            {
+                string key = DimensionKey(dimension);
+                int remainingMinimum = Math.Max(0,
+                    dimension.MinimumCount - succeededCounts.GetValueOrDefault(key));
+                return dimension with { MinimumCount = remainingMinimum };
+            })
+            .ToArray();
+    }
+
+    private bool TryBuildSucceededLayerFillPlan(
+        SucceededBaselineState baseline,
+        out SucceededLayerFillPlan? fillPlan,
+        out string message)
+    {
+        fillPlan = null;
+        message = string.Empty;
+        if (baseline.Boxes.Count == 0)
+            return true;
+
+        var definitionsByTypeId = GetBoxTypeDefinitions()
+            .ToDictionary(item => item.TypeId, item => item, StringComparer.Ordinal);
+        var collisionBoxes = BuildCollisionBoxesByNumber(baseline.Boxes, definitionsByTypeId);
+        var occupied = new List<PlacedBox>();
+        foreach (var placement in baseline.Placements
+                     .OrderBy(x => x.Order)
+                     .ThenBy(x => x.BoxNumber, StringComparer.Ordinal))
+        {
+            if (!collisionBoxes.TryGetValue(placement.BoxNumber, out var collisionBox))
+            {
+                message = $"成功基线缺少箱子 {placement.BoxNumber} 的尺寸信息。";
+                return false;
+            }
+
+            var placed = ToPlacedBox(collisionBox, placement, real: true);
+            if (!Fits(placed, occupied))
+            {
+                message = $"成功基线中的箱子 {placement.BoxNumber} 占位冲突，无法继续利用率规划。";
+                return false;
+            }
+
+            occupied.Add(placed);
+        }
+
+        int targetLayer = occupied.Max(x => x.Placement.LayerIndex);
+        var targetLayerBoxes = occupied
+            .Where(x => x.Placement.LayerIndex == targetLayer)
+            .ToArray();
+        if (targetLayerBoxes.Length == 0)
+            return true;
+
+        var typedLayerBoxes = new List<(PlacedBox Placed, Box Source, string TypeId)>(targetLayerBoxes.Length);
+        foreach (var placed in targetLayerBoxes)
+        {
+            if (!collisionBoxes.TryGetValue(placed.Placement.BoxNumber, out var sourceBox))
+            {
+                message = $"成功层箱子 {placed.Placement.BoxNumber} 缺少尺寸信息，无法识别箱型。";
+                return false;
+            }
+
+            string typeId = BoxTypeClassifier.ClassifyPlanBoxTypeId(
+                sourceBox.LengthMm,
+                sourceBox.WidthMm,
+                sourceBox.HeightMm);
+            typedLayerBoxes.Add((placed, sourceBox, typeId));
+        }
+
+        var succeededTypeSample = typedLayerBoxes
+            .GroupBy(x => x.TypeId, StringComparer.Ordinal)
+            .OrderByDescending(group => group.Count())
+            .ThenBy(group => group.Key, StringComparer.Ordinal)
+            .Select(group => group
+                .OrderBy(x => x.Placed.Placement.Order)
+                .ThenBy(x => x.Placed.Placement.BoxNumber, StringComparer.Ordinal)
+                .First())
+            .First();
+        string succeededTypeId = succeededTypeSample.TypeId;
+
+        var probeDimension = definitionsByTypeId.TryGetValue(succeededTypeId, out var definition)
+            ? new BoxDimension
+            {
+                LengthMm = definition.RepLengthMm,
+                WidthMm = definition.RepDepthMm,
+                HeightMm = definition.RepHeightMm,
+                MinimumCount = 0,
+            }
+            : new BoxDimension
+            {
+                LengthMm = succeededTypeSample.Source.LengthMm,
+                WidthMm = succeededTypeSample.Source.WidthMm,
+                HeightMm = succeededTypeSample.Source.HeightMm,
+                MinimumCount = 0,
+            };
+
+        var sameTypeTemplate = new Box
+        {
+            BoxNumber = "__succeeded_layer_probe__",
+            LengthMm = succeededTypeSample.Source.LengthMm,
+            WidthMm = succeededTypeSample.Source.WidthMm,
+            HeightMm = succeededTypeSample.Source.HeightMm,
+            WeightKg = 0,
+            Status = BoxStatus.OnShelf,
+            Order = 0,
+        };
+
+        double targetBaseZ = succeededTypeSample.Placed.BaseZ;
+        int neededCount = 0;
+        while (true)
+        {
+            var candidate = GenerateCandidates(sameTypeTemplate, occupied)
+                .FirstOrDefault(x => x.Placement.LayerIndex == targetLayer
+                    && Math.Abs(x.Candidate.BaseZ - targetBaseZ) <= Epsilon);
+            if (candidate is null)
+                break;
+
+            var placed = ToPlacedBox(sameTypeTemplate, candidate.Placement, real: false);
+            if (!Fits(placed, occupied))
+                break;
+
+            occupied.Add(placed);
+            neededCount++;
+        }
+
+        fillPlan = new SucceededLayerFillPlan(
+            succeededTypeId,
+            probeDimension,
+            neededCount);
+        return true;
+    }
+
+    private static IReadOnlyList<BoxDimension> ExcludeCandidateDimension(
+        IReadOnlyList<BoxDimension> dimensions,
+        BoxDimension excludedDimension)
+    {
+        string excludedKey = ExactDimensionKey(
+            excludedDimension.LengthMm,
+            excludedDimension.WidthMm,
+            excludedDimension.HeightMm);
+
+        return dimensions
+            .Where(item => !string.Equals(
+                ExactDimensionKey(item.LengthMm, item.WidthMm, item.HeightMm),
+                excludedKey,
+                StringComparison.Ordinal))
+            .ToArray();
+    }
 
     /// <summary>
     /// 按候选箱型计算最佳策略，并从库存挑选真实箱号写入当前内存（仅供 <see cref="PlanUtilizationFromInventory"/> 内部使用）。
@@ -843,9 +1392,185 @@ public sealed class StackPlanner
         if (!double.IsFinite(maxSelectableWeightKg) || maxSelectableWeightKg <= 0)
             throw new ArgumentOutOfRangeException(nameof(maxSelectableWeightKg), "最大选箱重量必须是有限正数。 ");
 
-        var utilization = PlanBestUtilization(dimensions, maxSelectableWeightKg);
+        var requestedDimensions = dimensions.ToArray();
+        _logger.Log(
+            PlannerLogLevel.Debug,
+            "utilization.selection.begin",
+            "开始执行库存选箱阶段。",
+            detail: $"RequestedCount={requestedDimensions.Length}, Requested={DescribeDimensions(requestedDimensions)}, MaxSelectableWeightKg={maxSelectableWeightKg:R}");
+
+        if (!TryBuildSucceededBaseline(out var succeededBaseline, out string baselineError))
+        {
+            _logger.Log(
+                PlannerLogLevel.Warning,
+                "utilization.selection.baseline_failed",
+                "成功基线构建失败。",
+                detail: baselineError);
+            return new InventoryUtilizationPlanResult
+            {
+                PlanningResult = false,
+                Message = baselineError,
+                PlannedCounts = Array.Empty<BoxTypeCount>(),
+                Layers = Array.Empty<LayerUtilizationSummary>(),
+                Utilization = 0,
+                Applied = false,
+                SelectedBoxCount = 0,
+            };
+        }
+
+        _logger.Log(
+            PlannerLogLevel.Debug,
+            "utilization.selection.baseline",
+            "成功基线构建完成。",
+            detail: $"SucceededCount={succeededBaseline.Boxes.Count}, BaselinePlacementCount={succeededBaseline.Placements.Count}, SucceededTypes={DescribeBoxTypeSummary(succeededBaseline.Boxes)}");
+
+        var excludedNumbers = succeededBaseline.Boxes
+            .Select(x => x.BoxNumber)
+            .ToHashSet(StringComparer.Ordinal);
+        var remainingDimensions = ReduceMinimumCountsBySucceeded(requestedDimensions, succeededBaseline.Boxes);
+        _logger.Log(
+            PlannerLogLevel.Debug,
+            "utilization.selection.minimums_reduced",
+            "已根据成功基线扣减候选尺寸最小数量。",
+            detail: $"RemainingDimensions={DescribeDimensions(remainingDimensions)}");
+
+        if (!TryBuildSucceededLayerFillPlan(succeededBaseline, out var fillPlan, out string fillPlanError))
+        {
+            _logger.Log(
+                PlannerLogLevel.Warning,
+                "utilization.selection.fill_plan_failed",
+                "成功层补齐计划构建失败。",
+                detail: fillPlanError);
+            return new InventoryUtilizationPlanResult
+            {
+                PlanningResult = false,
+                Message = fillPlanError,
+                PlannedCounts = Array.Empty<BoxTypeCount>(),
+                Layers = Array.Empty<LayerUtilizationSummary>(),
+                Utilization = 0,
+                Applied = false,
+                SelectedBoxCount = 0,
+            };
+        }
+
+        _logger.Log(
+            PlannerLogLevel.Debug,
+            "utilization.selection.fill_plan",
+            "成功层补齐计划构建完成。",
+            detail: fillPlan is null
+                ? "FillPlan=None"
+                : $"TypeId={fillPlan.TypeId}, NeededCount={fillPlan.NeededCount}, Dimension={DescribeDimension(fillPlan.Dimension)}");
+
+        var inventory = ClassifyInventoryBoxTypes();
+        var strategyExcludedNumbers = new HashSet<string>(excludedNumbers, StringComparer.Ordinal);
+        var selectedBoxes = new List<Box>();
+
+        if (fillPlan is not null)
+        {
+            // 成功层补齐后，不再把该箱型作为后续利用率候选尺寸。
+            remainingDimensions = ExcludeCandidateDimension(remainingDimensions, fillPlan.Dimension);
+            _logger.Log(
+                PlannerLogLevel.Debug,
+                "utilization.selection.fill_dimension_excluded",
+                "已从后续候选尺寸剔除成功层补齐箱型。",
+                detail: $"Excluded={DescribeDimension(fillPlan.Dimension)}, RemainingDimensions={DescribeDimensions(remainingDimensions)}");
+
+            if (fillPlan.NeededCount > 0)
+            {
+                var sameTypeQueue = new Queue<BoxTypeAssignment>(inventory.Assignments
+                    .Where(item => IsSelectableInventoryAssignment(item, maxSelectableWeightKg))
+                    .Where(item => !strategyExcludedNumbers.Contains(item.BoxNumber))
+                    .Where(item => string.Equals(item.TypeId, fillPlan.TypeId, StringComparison.Ordinal))
+                    .OrderBy(item => item.BoxNumber, StringComparer.Ordinal));
+
+                _logger.Log(
+                    PlannerLogLevel.Debug,
+                    "utilization.selection.fill_pool",
+                    "成功层补齐候选池统计完成。",
+                    detail: $"TypeId={fillPlan.TypeId}, NeededCount={fillPlan.NeededCount}, AvailableCount={sameTypeQueue.Count}");
+
+                if (sameTypeQueue.Count < fillPlan.NeededCount)
+                {
+                    _logger.Log(
+                        PlannerLogLevel.Warning,
+                        "utilization.selection.fill_pool_insufficient",
+                        "成功层补齐候选池不足。",
+                        detail: $"TypeId={fillPlan.TypeId}, NeededCount={fillPlan.NeededCount}, AvailableCount={sameTypeQueue.Count}");
+                    return new InventoryUtilizationPlanResult
+                    {
+                        PlanningResult = false,
+                        Message = $"成功层补齐需要箱型 {fillPlan.TypeId} 至少 {fillPlan.NeededCount} 个，但库存可选仅 {sameTypeQueue.Count} 个。",
+                        PlannedCounts = Array.Empty<BoxTypeCount>(),
+                        Layers = Array.Empty<LayerUtilizationSummary>(),
+                        Utilization = 0,
+                        Applied = false,
+                        SelectedBoxCount = 0,
+                    };
+                }
+
+                var pickedNumbers = new List<string>(fillPlan.NeededCount);
+
+                for (int i = 0; i < fillPlan.NeededCount; i++)
+                {
+                    var picked = sameTypeQueue.Dequeue();
+                    pickedNumbers.Add(picked.BoxNumber);
+                    selectedBoxes.Add(new Box
+                    {
+                        BoxNumber = picked.BoxNumber,
+                        LengthMm = picked.DepthMm,
+                        WidthMm = picked.LengthMm,
+                        HeightMm = picked.HeightMm,
+                        WeightKg = picked.WeightKg,
+                        Status = BoxStatus.OnShelf,
+                    });
+                    strategyExcludedNumbers.Add(picked.BoxNumber);
+                }
+
+                _logger.Log(
+                    PlannerLogLevel.Debug,
+                    "utilization.selection.fill_picked",
+                    "成功层补齐已选取真实箱号。",
+                    detail: $"TypeId={fillPlan.TypeId}, PickedCount={pickedNumbers.Count}, PickedBoxes={string.Join(",", pickedNumbers.Take(12))}{(pickedNumbers.Count > 12 ? ",..." : string.Empty)}");
+            }
+        }
+
+        // 成功基线已占用的堆垛高度（与基线分支 baseZ 口径一致），剩余高度才是策略可用的堆叠预算。
+        double baselineHeightMm = CalculateSucceededBaselineHeight(succeededBaseline.Placements);
+        double remainingStackHeightMm = Math.Max(0, StackMaxHeightMm - baselineHeightMm);
+        _logger.Log(
+            PlannerLogLevel.Debug,
+            "utilization.selection.height_budget",
+            "已扣除成功基线高度，计算策略可用堆垛高度。",
+            detail: $"BaselineHeightMm={baselineHeightMm:R}, RemainingStackHeightMm={remainingStackHeightMm:R}");
+
+        UtilizationPlanResult utilization;
+        if (remainingDimensions.Count == 0)
+        {
+            utilization = new UtilizationPlanResult
+            {
+                PlannedCounts = Array.Empty<BoxTypeCount>(),
+                Layers = Array.Empty<LayerUtilizationSummary>(),
+                Utilization = 0,
+                PlanningResult = true,
+                Message = string.Empty,
+            };
+        }
+        else
+        {
+            utilization = PlanBestUtilizationCore(
+                remainingDimensions,
+                maxSelectableWeightKg,
+                strategyExcludedNumbers,
+                remainingStackHeightMm);
+        }
+
         if (!utilization.PlanningResult)
         {
+            _logger.Log(
+                PlannerLogLevel.Warning,
+                "utilization.selection.strategy_failed",
+                "候选尺寸策略规划失败。",
+                detail: $"Message={utilization.Message}, PlannedCounts={DescribePlannedCounts(utilization.PlannedCounts)}, Utilization={utilization.Utilization:R}");
             return new InventoryUtilizationPlanResult
             {
                 PlanningResult = false,
@@ -869,9 +1594,9 @@ public sealed class StackPlanner
                 group => group.OrderBy(item => item.TypeId, StringComparer.Ordinal).First().TypeId,
                 StringComparer.Ordinal);
 
-        var inventory = ClassifyInventoryBoxTypes();
         var poolByType = inventory.Assignments
             .Where(item => IsSelectableInventoryAssignment(item, maxSelectableWeightKg))
+            .Where(item => !strategyExcludedNumbers.Contains(item.BoxNumber))
             .GroupBy(item => item.TypeId, StringComparer.Ordinal)
             .ToDictionary(
                 group => group.Key,
@@ -879,12 +1604,16 @@ public sealed class StackPlanner
                     group.OrderBy(item => item.BoxNumber, StringComparer.Ordinal)),
                 StringComparer.Ordinal);
 
-        var selectedBoxes = new List<Box>();
         foreach (var planned in utilization.PlannedCounts.Where(item => item.Count > 0))
         {
             string key = ExactDimensionKey(planned.LengthMm, planned.WidthMm, planned.HeightMm);
             if (!typeByDimension.TryGetValue(key, out var typeId))
             {
+                _logger.Log(
+                    PlannerLogLevel.Warning,
+                    "utilization.selection.dimension_unmapped",
+                    "策略箱型无法映射到配置箱型。",
+                    detail: $"Dimension={planned.LengthMm:0}x{planned.WidthMm:0}x{planned.HeightMm:0}, Count={planned.Count}");
                 return new InventoryUtilizationPlanResult
                 {
                     PlanningResult = false,
@@ -901,6 +1630,11 @@ public sealed class StackPlanner
             int available = queue?.Count ?? 0;
             if (available < planned.Count)
             {
+                _logger.Log(
+                    PlannerLogLevel.Warning,
+                    "utilization.selection.type_pool_insufficient",
+                    "策略映射后的箱型库存池不足。",
+                    detail: $"TypeId={typeId}, Needed={planned.Count}, Available={available}");
                 return new InventoryUtilizationPlanResult
                 {
                     PlanningResult = false,
@@ -929,29 +1663,94 @@ public sealed class StackPlanner
             }
         }
 
+        var snapshotBoxes = succeededBaseline.Boxes
+            .Select(CloneBox)
+            .Concat(selectedBoxes)
+            .ToArray();
+        var snapshotPlacements = succeededBaseline.Placements
+            .Select(ClonePlacement)
+            .ToArray();
+
         RestoreSnapshot(new PlannerSnapshot
         {
             Revision = 0,
             UpdatedAtUtc = DateTimeOffset.UtcNow,
-            Boxes = selectedBoxes,
+            Boxes = snapshotBoxes,
             Plan = new StackPlanResult
             {
-                Placements = Array.Empty<BoxPlacement>(),
-                PlanningResult = selectedBoxes.Count == 0,
+                Placements = snapshotPlacements,
+                PlanningResult = snapshotPlacements.Length == snapshotBoxes.Length,
             },
             ReusablePlacements = Array.Empty<ReusablePlacementSet>(),
         });
 
+        string message = succeededBaseline.Boxes.Count == 0
+            ? $"Core 已按最佳策略从库存选择 {selectedBoxes.Count} 个箱子。"
+            : $"Core 已在 {succeededBaseline.Boxes.Count} 个成功堆垛基础上按最佳策略从库存选择 {selectedBoxes.Count} 个箱子。";
+
+        _logger.Log(
+            PlannerLogLevel.Debug,
+            "utilization.selection.completed",
+            "库存选箱阶段完成并已写入 Core 内存。",
+            detail: $"SelectedBoxCount={selectedBoxes.Count}, SelectedTypes={DescribeBoxTypeSummary(selectedBoxes)}, PlannedCounts={DescribePlannedCounts(utilization.PlannedCounts)}, LayerCount={utilization.Layers.Count}, Utilization={utilization.Utilization:R}");
+
         return new InventoryUtilizationPlanResult
         {
             PlanningResult = true,
-            Message = $"Core 已按最佳策略从库存选择 {selectedBoxes.Count} 个箱子。",
+            Message = message,
             PlannedCounts = utilization.PlannedCounts,
             Layers = utilization.Layers,
             Utilization = utilization.Utilization,
             Applied = true,
             SelectedBoxCount = selectedBoxes.Count,
         };
+    }
+
+    /// <summary>
+    /// 计算成功基线占用的堆垛高度（从托盘地面起算的最高点）。
+    /// 与 <see cref="ToPlacedBox"/> 的 TopZ 口径一致：TopZ = PlaceFloorZMm - Zmm。
+    /// </summary>
+    private static double CalculateSucceededBaselineHeight(IReadOnlyList<BoxPlacement> placements)
+        => placements.Count == 0
+            ? 0
+            : Math.Max(0, placements.Max(x => PlaceFloorZMm - x.Zmm));
+
+    private bool TryBuildSucceededBaseline(
+        out SucceededBaselineState baseline,
+        out string message)
+    {
+        var boxes = new List<Box>();
+        var placements = new List<BoxPlacement>();
+        message = string.Empty;
+
+        foreach (var box in _group.MutableBoxes
+                     .Where(x => x.Status == BoxStatus.StackingSucceeded)
+                     .OrderBy(x => x.Order)
+                     .ThenBy(x => x.BoxNumber, StringComparer.Ordinal))
+        {
+            if (!_succeeded.TryGetValue(box.BoxNumber, out var fixedPlacement))
+            {
+                baseline = new SucceededBaselineState(Array.Empty<Box>(), Array.Empty<BoxPlacement>());
+                message = $"箱子 {box.BoxNumber} 处于 StackingSucceeded 但缺少固定落点。";
+                return false;
+            }
+
+            var placement = ClonePlacement(fixedPlacement.Placement);
+            boxes.Add(CloneBox(box) with
+            {
+                Status = BoxStatus.StackingSucceeded,
+                Order = placement.Order,
+            });
+            placements.Add(placement);
+        }
+
+        baseline = new SucceededBaselineState(
+            boxes.ToArray(),
+            placements
+                .OrderBy(x => x.Order)
+                .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
+                .ToArray());
+        return true;
     }
 
     /// <summary>
@@ -1006,13 +1805,14 @@ public sealed class StackPlanner
     private DirectStackResult? FindBestLayerStack(
         IReadOnlyList<DirectLayerResult> candidates,
         IReadOnlyList<BoxDimension> dimensions,
-        IReadOnlyDictionary<string, int> caps)
+        IReadOnlyDictionary<string, int> caps,
+        double maxStackHeightMm = StackMaxHeightMm)
     {
         var minimums = dimensions.Select(x => x.MinimumCount).ToArray();
         var remainingCaps = dimensions.Select(x => caps[DimensionKey(x)]).ToArray();
         var keys = dimensions.Select(DimensionKey).ToArray();
         var memo = new Dictionary<string, DirectStackResult?>();
-        return SearchLayerStack(candidates, StackMaxHeightMm, minimums, remainingCaps, keys, memo);
+        return SearchLayerStack(candidates, maxStackHeightMm, minimums, remainingCaps, keys, memo);
     }
 
     private DirectStackResult? SearchLayerStack(
@@ -1228,16 +2028,38 @@ public sealed class StackPlanner
     /// </remarks>
     public StackPlanResult GenerateBestUtilizationPlan()
     {
+        _logger.Log(
+            PlannerLogLevel.Debug,
+            "utilization.plan.begin",
+            "开始执行真实箱子利用率排布。",
+            detail: $"TotalBoxes={_group.MutableBoxes.Count}, OnShelf={_group.MutableBoxes.Count(x => x.Status == BoxStatus.OnShelf)}, Succeeded={_group.MutableBoxes.Count(x => x.Status == BoxStatus.StackingSucceeded)}, StatusSummary={DescribeStatusSummary(_group.MutableBoxes)}");
+
         ApplyPendingUtilizationOrders();
         AssignOrders(preserveExistingOnShelf: true);
-        var boxes = _group.MutableBoxes
+        var definitionsByTypeId = GetBoxTypeDefinitions()
+            .ToDictionary(item => item.TypeId, item => item, StringComparer.Ordinal);
+        var utilizationCollisionBoxes = BuildCollisionBoxesByNumber(
+            _group.MutableBoxes,
+            definitionsByTypeId);
+        var onShelfBoxes = _group.MutableBoxes
             .Where(x => x.Status == BoxStatus.OnShelf)
             .OrderBy(x => x.Order)
             .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
             .ToArray();
 
-        if (_group.MutableBoxes.Any(x => x.Status != BoxStatus.OnShelf))
+        if (_group.MutableBoxes.Any(x => x.Status is not (BoxStatus.OnShelf or BoxStatus.StackingSucceeded)))
         {
+            var unsupported = _group.MutableBoxes
+                .Where(x => x.Status is not (BoxStatus.OnShelf or BoxStatus.StackingSucceeded))
+                .Select(x => $"{x.BoxNumber}:{x.Status}")
+                .Take(12)
+                .ToArray();
+            _logger.Log(
+                PlannerLogLevel.Warning,
+                "utilization.plan.invalid_status",
+                "存在不支持的箱子状态，利用率排布已终止。",
+                detail: $"UnsupportedCount={unsupported.Length}, Unsupported={string.Join(",", unsupported)}");
+
             _lastPlan = new StackPlanResult
             {
                 Placements = Array.Empty<BoxPlacement>(),
@@ -1247,7 +2069,91 @@ public sealed class StackPlanner
             return ClonePlan(_lastPlan);
         }
 
-        var planBoxes = BuildUtilizationPlanBoxes(boxes);
+        var succeededPlacements = new Dictionary<string, BoxPlacement>(StringComparer.Ordinal);
+        var occupied = new List<PlacedBox>();
+        foreach (var succeededBox in _group.MutableBoxes
+                     .Where(x => x.Status == BoxStatus.StackingSucceeded)
+                     .OrderBy(x => x.Order)
+                     .ThenBy(x => x.BoxNumber, StringComparer.Ordinal))
+        {
+            if (!_succeeded.TryGetValue(succeededBox.BoxNumber, out var fixedData))
+            {
+                _logger.Log(
+                    PlannerLogLevel.Warning,
+                    "utilization.plan.succeeded_missing_fixed",
+                    "成功箱缺少固定落点，利用率排布已终止。",
+                    detail: $"BoxNumber={succeededBox.BoxNumber}",
+                    boxNumber: succeededBox.BoxNumber);
+                _lastPlan = new StackPlanResult
+                {
+                    Placements = Array.Empty<BoxPlacement>(),
+                    PlanningResult = false,
+                };
+                _hasGeneratedPlan = true;
+                return ClonePlan(_lastPlan);
+            }
+
+            var placement = ClonePlacement(fixedData.Placement);
+            var placed = ToPlacedBox(utilizationCollisionBoxes[succeededBox.BoxNumber], placement, real: true);
+            if (!Fits(placed, occupied))
+            {
+                _logger.Log(
+                    PlannerLogLevel.Warning,
+                    "utilization.plan.succeeded_collision",
+                    "成功箱固定落点与当前占位冲突，利用率排布已终止。",
+                    detail: $"BoxNumber={succeededBox.BoxNumber}, Order={placement.Order}, Layer={placement.LayerIndex}, X={placement.Xmm:R}, Y={placement.Ymm:R}, Z={placement.Zmm:R}",
+                    boxNumber: succeededBox.BoxNumber);
+                _lastPlan = new StackPlanResult
+                {
+                    Placements = Array.Empty<BoxPlacement>(),
+                    PlanningResult = false,
+                };
+                _hasGeneratedPlan = true;
+                return ClonePlan(_lastPlan);
+            }
+
+            occupied.Add(placed);
+            succeededPlacements[succeededBox.BoxNumber] = placement;
+            succeededBox.Order = placement.Order;
+        }
+
+        if (succeededPlacements.Count > 0)
+        {
+            _logger.Log(
+                PlannerLogLevel.Debug,
+                "utilization.plan.with_succeeded_baseline",
+                "检测到成功基线，进入基线约束排布分支。",
+                detail: $"SucceededCount={succeededPlacements.Count}, OnShelfCount={onShelfBoxes.Length}");
+            var onShelfCollisionBoxes = onShelfBoxes
+                .Select(box => utilizationCollisionBoxes[box.BoxNumber])
+                .OrderBy(box => box.Order)
+                .ThenBy(box => box.BoxNumber, StringComparer.Ordinal)
+                .ToArray();
+            return GenerateBestUtilizationPlanWithSucceededBaseline(
+                onShelfCollisionBoxes,
+                occupied,
+                succeededPlacements,
+                utilizationCollisionBoxes);
+        }
+
+        if (onShelfBoxes.Length == 0)
+        {
+            _logger.Log(
+                PlannerLogLevel.Info,
+                "utilization.plan.no_onshelf",
+                "没有 OnShelf 箱子，利用率排布直接成功。",
+                detail: $"SucceededCount={succeededPlacements.Count}");
+            _lastPlacements.Clear();
+            _lastPlan = new StackPlanResult
+            {
+                Placements = Array.Empty<BoxPlacement>(),
+                PlanningResult = true,
+            };
+            _hasGeneratedPlan = true;
+            return ClonePlan(_lastPlan);
+        }
+
+        var planBoxes = BuildUtilizationPlanBoxes(onShelfBoxes);
         var remaining = planBoxes.ToList();
         var placements = new List<BoxPlacement>();
         double baseZ = 0;
@@ -1284,7 +2190,14 @@ public sealed class StackPlanner
                 .ThenBy(x => x.Signature, StringComparer.Ordinal)
                 .FirstOrDefault();
             if (selected is null)
+            {
+                _logger.Log(
+                    PlannerLogLevel.Warning,
+                    "utilization.plan.layer_unplaceable",
+                    "当前层未找到合法布局，终止后续层排布。",
+                    detail: $"RemainingCount={remaining.Count}, BaseZ={baseZ:R}, LayerIndex={layerIndex}, RemainingTypes={DescribeUtilizationPlanBoxSummary(remaining)}");
                 break;
+            }
 
             foreach (var item in selected.Placements)
             {
@@ -1308,26 +2221,331 @@ public sealed class StackPlanner
             layerIndex++;
         }
 
-        var ordered = placements
+        var orderedNew = placements
             .OrderBy(x => x.LayerIndex)
             .ThenByDescending(x => x.Xmm)
             .ThenByDescending(x => x.Ymm)
             .ThenBy(x => x.Order)
             .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
             .ToArray();
-        ordered = NormalizePlacementOrders(ordered);
-        foreach (var placement in ordered)
+        orderedNew = NormalizePlacementOrders(orderedNew);
+
+        foreach (var placement in orderedNew)
             FindBox(placement.BoxNumber)!.Order = placement.Order;
+
+        var ordered = orderedNew
+            .OrderBy(x => x.Order)
+            .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
+            .ToArray();
+
         _lastPlacements.Clear();
         foreach (var placement in ordered)
             _lastPlacements[placement.BoxNumber] = ClonePlacement(placement);
         _lastPlan = new StackPlanResult
         {
             Placements = ordered,
-            PlanningResult = ordered.Length == boxes.Length,
+            PlanningResult = ordered.Length == onShelfBoxes.Length,
         };
         _hasGeneratedPlan = true;
+        _logger.Log(
+            _lastPlan.PlanningResult ? PlannerLogLevel.Info : PlannerLogLevel.Warning,
+            "utilization.plan.completed",
+            "真实箱子利用率排布完成。",
+            detail: $"PlanningResult={_lastPlan.PlanningResult}, Placements={ordered.Length}, OnShelfCount={onShelfBoxes.Length}, Unplaced={Math.Max(0, onShelfBoxes.Length - ordered.Length)}");
         return ClonePlan(_lastPlan);
+    }
+
+    private StackPlanResult GenerateBestUtilizationPlanWithSucceededBaseline(
+        IReadOnlyList<Box> onShelfBoxes,
+        IReadOnlyList<PlacedBox> baselineOccupied,
+        IReadOnlyDictionary<string, BoxPlacement> lockedPlacements,
+        IReadOnlyDictionary<string, Box> collisionBoxesByNumber)
+    {
+        _logger.Log(
+            PlannerLogLevel.Debug,
+            "utilization.plan.baseline.begin",
+            "开始执行成功基线约束下的利用率排布。",
+            detail: $"OnShelfCount={onShelfBoxes.Count}, BaselineOccupied={baselineOccupied.Count}, LockedPlacementCount={lockedPlacements.Count}");
+
+        if (onShelfBoxes.Count == 0)
+        {
+            var lockedOnly = lockedPlacements.Values
+                .OrderBy(x => x.Order)
+                .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
+                .Select(ClonePlacement)
+                .ToArray();
+
+            _lastPlacements.Clear();
+            foreach (var placement in lockedOnly)
+                _lastPlacements[placement.BoxNumber] = ClonePlacement(placement);
+
+            _lastPlan = new StackPlanResult
+            {
+                Placements = lockedOnly,
+                PlanningResult = true,
+            };
+            _hasGeneratedPlan = true;
+            _logger.Log(
+                PlannerLogLevel.Info,
+                "utilization.plan.baseline.completed",
+                "成功基线约束排布完成（无 OnShelf 箱子）。",
+                detail: $"PlanningResult=True, Placements={lockedOnly.Length}");
+            return ClonePlan(_lastPlan);
+        }
+
+        int targetLayer = baselineOccupied.Max(x => x.Placement.LayerIndex);
+        var targetLayerBoxes = baselineOccupied
+            .Where(x => x.Placement.LayerIndex == targetLayer)
+            .ToArray();
+        var typedLayerBoxes = targetLayerBoxes
+            .Select(placed =>
+            {
+                if (!collisionBoxesByNumber.TryGetValue(placed.Placement.BoxNumber, out var sourceBox))
+                    return (Found: false, Placed: placed, Source: default(Box), TypeId: string.Empty);
+
+                string typeId = BoxTypeClassifier.ClassifyPlanBoxTypeId(
+                    sourceBox.LengthMm,
+                    sourceBox.WidthMm,
+                    sourceBox.HeightMm);
+                return (Found: true, Placed: placed, Source: sourceBox, TypeId: typeId);
+            })
+            .ToArray();
+
+        if (typedLayerBoxes.Any(x => !x.Found))
+        {
+            _logger.Log(
+                PlannerLogLevel.Warning,
+                "utilization.plan.baseline.type_resolve_failed",
+                "成功层存在无法解析尺寸的箱子，排布失败。",
+                detail: $"TargetLayer={targetLayer}, TargetLayerCount={targetLayerBoxes.Length}");
+            _lastPlan = new StackPlanResult
+            {
+                Placements = Array.Empty<BoxPlacement>(),
+                PlanningResult = false,
+            };
+            _hasGeneratedPlan = true;
+            return ClonePlan(_lastPlan);
+        }
+
+        var succeededTypeSample = typedLayerBoxes
+            .GroupBy(x => x.TypeId, StringComparer.Ordinal)
+            .OrderByDescending(group => group.Count())
+            .ThenBy(group => group.Key, StringComparer.Ordinal)
+            .Select(group => group
+                .OrderBy(x => x.Placed.Placement.Order)
+                .ThenBy(x => x.Placed.Placement.BoxNumber, StringComparer.Ordinal)
+                .First())
+            .First();
+
+        string succeededTypeId = succeededTypeSample.TypeId;
+        double targetBaseZ = succeededTypeSample.Placed.BaseZ;
+        var sameTypeTemplate = new Box
+        {
+            BoxNumber = "__succeeded_layer_probe__",
+            LengthMm = succeededTypeSample.Source!.LengthMm,
+            WidthMm = succeededTypeSample.Source.WidthMm,
+            HeightMm = succeededTypeSample.Source.HeightMm,
+            WeightKg = 0,
+            Status = BoxStatus.OnShelf,
+            Order = 0,
+        };
+
+        var planBoxes = BuildUtilizationPlanBoxes(onShelfBoxes);
+        var occupied = baselineOccupied.ToList();
+        var mergedPlacements = new Dictionary<string, BoxPlacement>(StringComparer.Ordinal);
+        foreach (var locked in lockedPlacements.Values)
+            mergedPlacements[locked.BoxNumber] = ClonePlacement(locked);
+
+        var placedSucceededTypeNumbers = new HashSet<string>(StringComparer.Ordinal);
+        int sameTypeCandidateCount = planBoxes.Count(x => string.Equals(x.TypeId, succeededTypeId, StringComparison.Ordinal));
+        foreach (var planBox in planBoxes
+                     .Where(x => string.Equals(x.TypeId, succeededTypeId, StringComparison.Ordinal))
+                     .OrderBy(x => x.Source.Order)
+                     .ThenBy(x => x.Source.BoxNumber, StringComparer.Ordinal))
+        {
+            var box = planBox.Source;
+            var candidate = GenerateCandidates(box, occupied)
+                .FirstOrDefault(x => x.Placement.LayerIndex == targetLayer
+                    && Math.Abs(x.Candidate.BaseZ - targetBaseZ) <= Epsilon);
+            if (candidate is null)
+                continue;
+
+            var placed = ToPlacedBox(box, candidate.Placement, false);
+            if (!Fits(placed, occupied))
+                continue;
+
+            mergedPlacements[box.BoxNumber] = candidate.Placement;
+            occupied.Add(placed);
+            placedSucceededTypeNumbers.Add(box.BoxNumber);
+        }
+
+        _logger.Log(
+            PlannerLogLevel.Debug,
+            "utilization.plan.baseline.fill_attempt",
+            "已尝试补齐成功层同型箱。",
+            detail: $"SucceededTypeId={succeededTypeId}, CandidateCount={sameTypeCandidateCount}, PlacedCount={placedSucceededTypeNumbers.Count}, TargetLayer={targetLayer}, TargetBaseZ={targetBaseZ:R}");
+
+        int openSlotCount = GenerateCandidates(sameTypeTemplate, occupied)
+            .Count(x => x.Placement.LayerIndex == targetLayer
+                && Math.Abs(x.Candidate.BaseZ - targetBaseZ) <= Epsilon);
+        bool layerIsFull = openSlotCount == 0;
+        if (!layerIsFull)
+        {
+            _logger.Log(
+                PlannerLogLevel.Warning,
+                "utilization.plan.baseline.layer_not_full",
+                "成功层同型补齐后仍存在可放空位，排布失败。",
+                detail: $"SucceededTypeId={succeededTypeId}, OpenSlotCount={openSlotCount}, PlacedCount={placedSucceededTypeNumbers.Count}, CandidateCount={sameTypeCandidateCount}, TargetLayer={targetLayer}, TargetBaseZ={targetBaseZ:R}");
+            _lastPlan = new StackPlanResult
+            {
+                Placements = Array.Empty<BoxPlacement>(),
+                PlanningResult = false,
+            };
+            _hasGeneratedPlan = true;
+            return ClonePlan(_lastPlan);
+        }
+
+        var remaining = planBoxes
+            .Where(x => !placedSucceededTypeNumbers.Contains(x.Source.BoxNumber)
+                && !string.Equals(x.TypeId, succeededTypeId, StringComparison.Ordinal))
+            .ToList();
+        int remainingBoxCount = remaining.Count;
+        var additionalPlacements = new List<BoxPlacement>();
+        double baseZ = occupied.Max(x => x.TopZ);
+        int layerIndex = occupied.Max(x => x.Placement.LayerIndex) + 1;
+
+        while (remaining.Count > 0)
+        {
+            var layerCandidates = new List<DirectBoxLayerResult>();
+            foreach (var heightGroup in remaining.GroupBy(x => x.PlanHeightMm).OrderBy(x => x.Key))
+            {
+                if (baseZ + heightGroup.Key > StackMaxHeightMm + Epsilon)
+                    continue;
+
+                var typeKeys = heightGroup
+                    .Select(x => x.TypeKey)
+                    .Distinct(StringComparer.Ordinal)
+                    .OrderBy(x => x, StringComparer.Ordinal)
+                    .ToArray();
+                foreach (var combination in TypeCombinations(typeKeys, 3))
+                {
+                    var candidate = FindBestFiniteDirectLayer(
+                        remaining.Where(x => combination.Contains(x.TypeKey, StringComparer.Ordinal)).ToArray(),
+                        heightGroup.Key,
+                        combination.ToHashSet(StringComparer.Ordinal));
+                    if (candidate is not null)
+                        layerCandidates.Add(candidate);
+                }
+            }
+
+            var selected = layerCandidates
+                .OrderByDescending(x => x.OccupiedArea)
+                .ThenByDescending(x => x.Placements.Count)
+                .ThenBy(x => DirectBoxFragmentation(x.Placements))
+                .ThenBy(x => x.HeightMm)
+                .ThenBy(x => x.Signature, StringComparer.Ordinal)
+                .FirstOrDefault();
+            if (selected is null)
+            {
+                _logger.Log(
+                    PlannerLogLevel.Warning,
+                    "utilization.plan.baseline.layer_unplaceable",
+                    "成功基线约束下，后续层未找到合法布局。",
+                    detail: $"RemainingCount={remaining.Count}, BaseZ={baseZ:R}, LayerIndex={layerIndex}, RemainingTypes={DescribeUtilizationPlanBoxSummary(remaining)}");
+                break;
+            }
+
+            foreach (var item in selected.Placements)
+            {
+                var placement = new BoxPlacement
+                {
+                    Order = item.Box.Source.Order,
+                    BoxNumber = item.Box.Source.BoxNumber,
+                    Xmm = Round(item.Xmm),
+                    Ymm = Round(item.Ymm),
+                    Zmm = Round(PlaceFloorZMm - baseZ - item.Box.PlanHeightMm),
+                    OrientationDeg = item.OrientationDeg,
+                    LayerIndex = layerIndex,
+                };
+                additionalPlacements.Add(placement);
+                occupied.Add(ToPlacedBox(item.Box.Source, placement, false));
+            }
+
+            var usedNumbers = selected.Placements
+                .Select(x => x.Box.Source.BoxNumber)
+                .ToHashSet(StringComparer.Ordinal);
+            remaining.RemoveAll(x => usedNumbers.Contains(x.Source.BoxNumber));
+            baseZ += selected.HeightMm;
+            layerIndex++;
+        }
+
+        foreach (var placement in additionalPlacements)
+            mergedPlacements[placement.BoxNumber] = placement;
+
+        var normalized = AppendAfterSucceededOrders(
+            new SearchState(
+                Array.Empty<Box>(),
+                occupied.ToArray(),
+                mergedPlacements,
+                -1,
+                null),
+            _group.MutableBoxes);
+
+        var ordered = normalized.Placements.Values
+            .OrderBy(x => x.Order)
+            .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
+            .ToArray();
+        foreach (var placement in ordered)
+            FindBox(placement.BoxNumber)!.Order = placement.Order;
+
+        _lastPlacements.Clear();
+        foreach (var placement in ordered)
+            _lastPlacements[placement.BoxNumber] = ClonePlacement(placement);
+
+        int expected = lockedPlacements.Count
+            + placedSucceededTypeNumbers.Count
+            + remainingBoxCount;
+        _lastPlan = new StackPlanResult
+        {
+            Placements = ordered,
+            PlanningResult = ordered.Length == expected,
+        };
+        _hasGeneratedPlan = true;
+        _logger.Log(
+            _lastPlan.PlanningResult ? PlannerLogLevel.Info : PlannerLogLevel.Warning,
+            "utilization.plan.baseline.completed",
+            "成功基线约束排布完成。",
+            detail: $"PlanningResult={_lastPlan.PlanningResult}, Placements={ordered.Length}, Expected={expected}, LockedCount={lockedPlacements.Count}, FilledSucceededType={placedSucceededTypeNumbers.Count}, RemainingInitial={remainingBoxCount}");
+        return ClonePlan(_lastPlan);
+    }
+
+    private static SearchState AppendAfterSucceededOrders(SearchState state, IReadOnlyList<Box> all)
+    {
+        var boxesByNumber = all.ToDictionary(x => x.BoxNumber, StringComparer.Ordinal);
+        var succeededNumbers = all
+            .Where(x => x.Status == BoxStatus.StackingSucceeded)
+            .Select(x => x.BoxNumber)
+            .ToHashSet(StringComparer.Ordinal);
+
+        var replacements = new Dictionary<string, BoxPlacement>(StringComparer.Ordinal);
+        foreach (var placement in state.Placements.Values.Where(x => succeededNumbers.Contains(x.BoxNumber)))
+            replacements[placement.BoxNumber] = placement;
+
+        int nextOrder = replacements.Values.Select(x => x.Order).DefaultIfEmpty(-1).Max() + 1;
+        foreach (var placement in state.Placements.Values
+                     .Where(x => !succeededNumbers.Contains(x.BoxNumber))
+                     .OrderBy(x => x.LayerIndex)
+                     .ThenByDescending(x => x.Xmm)
+                     .ThenByDescending(x => x.Ymm)
+                     .ThenByDescending(x => BoxBaseArea(boxesByNumber[x.BoxNumber]))
+                     .ThenBy(x => BoxTypeKey(boxesByNumber[x.BoxNumber]), StringComparer.Ordinal)
+                     .ThenBy(x => boxesByNumber[x.BoxNumber].Order)
+                     .ThenBy(x => x.BoxNumber, StringComparer.Ordinal))
+        {
+            replacements[placement.BoxNumber] = placement with { Order = nextOrder++ };
+        }
+
+        return state with { Placements = replacements };
     }
 
     private static IReadOnlyList<UtilizationPlanBox> BuildUtilizationPlanBoxes(
@@ -1370,6 +2588,87 @@ public sealed class StackPlanner
         }
 
         return result;
+    }
+
+    private static Dictionary<string, Box> BuildCollisionBoxesByNumber(
+        IReadOnlyList<Box> boxes,
+        IReadOnlyDictionary<string, BoxTypeDefinition> definitionsByTypeId)
+    {
+        var mapped = new Dictionary<string, Box>(StringComparer.Ordinal);
+        foreach (var box in boxes)
+        {
+            var collisionBox = ToCollisionSizedBox(box, definitionsByTypeId);
+            mapped[box.BoxNumber] = collisionBox;
+        }
+
+        return mapped;
+    }
+
+    private static Box ToCollisionSizedBox(
+        Box box,
+        IReadOnlyDictionary<string, BoxTypeDefinition> definitionsByTypeId)
+    {
+        var collisionBox = CloneBox(box);
+        var definition = FindBestCollisionDefinition(box, definitionsByTypeId);
+        if (definition is null)
+            return collisionBox;
+
+        // 碰撞体统一按箱型标准尺寸，避免真实尺寸与规划尺寸口径切换。
+        return collisionBox with
+        {
+            LengthMm = definition.RepLengthMm,
+            WidthMm = definition.RepDepthMm,
+            HeightMm = definition.RepHeightMm,
+        };
+    }
+
+    private static BoxTypeDefinition? FindBestCollisionDefinition(
+        Box box,
+        IReadOnlyDictionary<string, BoxTypeDefinition> definitionsByTypeId)
+    {
+        const double toleranceMm = 30;
+
+        if (!double.IsFinite(box.LengthMm) || !double.IsFinite(box.WidthMm) || !double.IsFinite(box.HeightMm)
+            || box.LengthMm <= 0 || box.WidthMm <= 0 || box.HeightMm <= 0)
+        {
+            return null;
+        }
+
+        BoxTypeDefinition? best = null;
+        string? bestTypeId = null;
+        double bestDistance = double.MaxValue;
+
+        foreach (var entry in definitionsByTypeId)
+        {
+            var definition = entry.Value;
+            if (Math.Abs(box.LengthMm - definition.RepLengthMm) > toleranceMm
+                || Math.Abs(box.HeightMm - definition.RepHeightMm) > toleranceMm
+                || Math.Abs(box.WidthMm - definition.RepDepthMm) > toleranceMm)
+            {
+                continue;
+            }
+
+            double distance = Math.Abs(box.LengthMm - definition.RepLengthMm)
+                + Math.Abs(box.HeightMm - definition.RepHeightMm)
+                + Math.Abs(box.WidthMm - definition.RepDepthMm);
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                best = definition;
+                bestTypeId = entry.Key;
+                continue;
+            }
+
+            if (Math.Abs(distance - bestDistance) <= 0.0001
+                && bestTypeId is not null
+                && string.CompareOrdinal(entry.Key, bestTypeId) < 0)
+            {
+                best = definition;
+                bestTypeId = entry.Key;
+            }
+        }
+
+        return best;
     }
 
     private DirectBoxLayerResult? FindBestFiniteDirectLayer(
@@ -1531,6 +2830,74 @@ public sealed class StackPlanner
             lengthMm.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
             widthMm.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
             heightMm.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+
+    private static string DescribeDimension(BoxDimension dimension)
+        => $"{dimension.LengthMm:0.###}x{dimension.WidthMm:0.###}x{dimension.HeightMm:0.###}(min={dimension.MinimumCount})";
+
+    private static string DescribeDimensions(IEnumerable<BoxDimension> dimensions, int maxItems = 10)
+    {
+        var items = dimensions
+            .Select(DescribeDimension)
+            .ToArray();
+        if (items.Length == 0)
+            return "none";
+        if (items.Length <= maxItems)
+            return string.Join(";", items);
+        return string.Join(";", items.Take(maxItems)) + ";...";
+    }
+
+    private static string DescribePlannedCounts(IEnumerable<BoxTypeCount> plannedCounts, int maxItems = 10)
+    {
+        var items = plannedCounts
+            .Where(x => x.Count > 0)
+            .Select(x => $"{x.LengthMm:0.###}x{x.WidthMm:0.###}x{x.HeightMm:0.###}={x.Count}")
+            .ToArray();
+        if (items.Length == 0)
+            return "none";
+        if (items.Length <= maxItems)
+            return string.Join(";", items);
+        return string.Join(";", items.Take(maxItems)) + ";...";
+    }
+
+    private static string DescribeStatusSummary(IEnumerable<Box> boxes)
+    {
+        var items = boxes
+            .GroupBy(x => x.Status)
+            .OrderBy(group => group.Key)
+            .Select(group => $"{group.Key}:{group.Count()}")
+            .ToArray();
+        return items.Length == 0 ? "none" : string.Join(",", items);
+    }
+
+    private static string DescribeBoxTypeSummary(IEnumerable<Box> boxes, int maxItems = 10)
+    {
+        var items = boxes
+            .GroupBy(SameSpecTypeId, StringComparer.Ordinal)
+            .OrderByDescending(group => group.Count())
+            .ThenBy(group => group.Key, StringComparer.Ordinal)
+            .Select(group => $"{group.Key}:{group.Count()}")
+            .ToArray();
+        if (items.Length == 0)
+            return "none";
+        if (items.Length <= maxItems)
+            return string.Join(",", items);
+        return string.Join(",", items.Take(maxItems)) + ",...";
+    }
+
+    private static string DescribeUtilizationPlanBoxSummary(IEnumerable<UtilizationPlanBox> boxes, int maxItems = 10)
+    {
+        var items = boxes
+            .GroupBy(x => x.TypeId, StringComparer.Ordinal)
+            .OrderByDescending(group => group.Count())
+            .ThenBy(group => group.Key, StringComparer.Ordinal)
+            .Select(group => $"{group.Key}:{group.Count()}")
+            .ToArray();
+        if (items.Length == 0)
+            return "none";
+        if (items.Length <= maxItems)
+            return string.Join(",", items);
+        return string.Join(",", items.Take(maxItems)) + ",...";
+    }
 
     private StackPlanner CreatePlanningCopy()
     {
@@ -1966,12 +3333,14 @@ public sealed class StackPlanner
     /// </summary>
     private SearchState SearchOnShelf(IReadOnlyList<Box> boxes, IReadOnlyList<PlacedBox> initialOccupied)
         => SearchOnShelf(boxes, initialOccupied,
-            new Dictionary<string, BoxPlacement>(StringComparer.Ordinal));
+            new Dictionary<string, BoxPlacement>(StringComparer.Ordinal),
+            startAboveHighest: true);
 
     private SearchState SearchOnShelf(
         IReadOnlyList<Box> boxes,
         IReadOnlyList<PlacedBox> initialOccupied,
-        IReadOnlyDictionary<string, BoxPlacement> initialPlacements)
+        IReadOnlyDictionary<string, BoxPlacement> initialPlacements,
+        bool startAboveHighest = true)
     {
         var initial = new SearchState(
             boxes.Where(x => !initialPlacements.ContainsKey(x.BoxNumber)).ToArray(),
@@ -1984,7 +3353,7 @@ public sealed class StackPlanner
         var current = initial;
         while (current.Remaining.Count > 0)
         {
-            var layerCandidate = FindBestSingleLayerCandidate(current);
+            var layerCandidate = FindBestSingleLayerCandidate(current, startAboveHighest);
             if (layerCandidate is null)
                 break;
 
@@ -1996,7 +3365,7 @@ public sealed class StackPlanner
         // 没有任何可放位置时结束；尾部模式已经在上面的分支中完成。
         if (current.Remaining.Count > 0)
         {
-            var topLayer = FindBestSingleLayerCandidate(current)?.State;
+            var topLayer = FindBestSingleLayerCandidate(current, startAboveHighest)?.State;
             if (topLayer is not null)
                 current = topLayer;
         }
@@ -2008,7 +3377,9 @@ public sealed class StackPlanner
     /// 在当前最低可用层执行一次混合箱型有限宽度单层装箱。
     /// 布局比较严格按利用率、碎片、包围区域、支撑面积和确定性签名进行。
     /// </summary>
-    private LayerSearchCandidate? FindBestSingleLayerCandidate(SearchState initial)
+    private LayerSearchCandidate? FindBestSingleLayerCandidate(
+        SearchState initial,
+        bool startAboveHighest = true)
     {
         var heightGroups = new List<List<Box>>();
         foreach (var box in initial.Remaining
@@ -2039,7 +3410,10 @@ public sealed class StackPlanner
             foreach (var combination in TypeCombinations(typeKeys, maxSize: 3))
             {
                 var layer = TryPackBestSingleLayer(
-                    initial, height, combination.ToHashSet(StringComparer.Ordinal));
+                    initial,
+                    height,
+                    combination.ToHashSet(StringComparer.Ordinal),
+                    startAboveHighest: startAboveHighest);
                 AddLayerCandidate(ref best, initial, layer, singleType: combination.Length == 1, height);
             }
         }
@@ -2489,6 +3863,15 @@ public sealed class StackPlanner
             box.HeightMm.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
     }
 
+    private static string BoxTypeKey(PlacedBox box)
+    {
+        double first = Math.Min(box.Length, box.Width);
+        double second = Math.Max(box.Length, box.Width);
+        return string.Join("x", first.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+            second.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+            box.Height.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+    }
+
     private static int SearchPlacedCount(SearchState state) => state.Placements.Count;
     private static int SearchUpperBound(SearchState state) => state.Placements.Count + state.Remaining.Count;
     private static int SearchMaxLayer(SearchState state) => state.Occupied.Count == 0 ? 0 : state.Occupied.Max(x => x.Placement.LayerIndex);
@@ -2629,6 +4012,105 @@ public sealed class StackPlanner
     /// <summary>按唯一箱号查找内部箱子对象。</summary>
     private Box? FindBox(string number) => _group.MutableBoxes.FirstOrDefault(x => x.BoxNumber == number);
 
+    private static bool TryNormalizeSucceededPlacement(
+        SucceededPlacementRecord? input,
+        out SucceededPlacementRecord normalized)
+    {
+        normalized = default!;
+        if (input is null || input.Placement is null)
+            return false;
+
+        string boxNumber = input.BoxNumber?.Trim() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(boxNumber))
+            return false;
+
+        if (!double.IsFinite(input.LengthMm) || input.LengthMm <= 0
+            || !double.IsFinite(input.WidthMm) || input.WidthMm <= 0
+            || !double.IsFinite(input.HeightMm) || input.HeightMm <= 0
+            || !double.IsFinite(input.WeightKg) || input.WeightKg < 0)
+            return false;
+
+        string placementBoxNumber = input.Placement.BoxNumber?.Trim() ?? string.Empty;
+        if (!string.Equals(boxNumber, placementBoxNumber, StringComparison.Ordinal))
+            return false;
+
+        if (!double.IsFinite(input.Placement.Xmm)
+            || !double.IsFinite(input.Placement.Ymm)
+            || !double.IsFinite(input.Placement.Zmm)
+            || input.Placement.Order < 0
+            || input.Placement.LayerIndex < 0
+            || input.Placement.OrientationDeg is not (0 or 90))
+            return false;
+
+        normalized = new SucceededPlacementRecord
+        {
+            BoxNumber = boxNumber,
+            LengthMm = input.LengthMm,
+            WidthMm = input.WidthMm,
+            HeightMm = input.HeightMm,
+            WeightKg = input.WeightKg,
+            Placement = new BoxPlacement
+            {
+                Order = input.Placement.Order,
+                BoxNumber = boxNumber,
+                Xmm = input.Placement.Xmm,
+                Ymm = input.Placement.Ymm,
+                Zmm = input.Placement.Zmm,
+                OrientationDeg = input.Placement.OrientationDeg,
+                LayerIndex = input.Placement.LayerIndex,
+            },
+        };
+        return true;
+    }
+
+    /// <summary>
+    /// 校验成功堆垛集合。实际已发生的成功落点不因超出托盘或间距不足而拒绝写入，
+    /// 仅拒绝 Order 重复；几何问题以警告文本返回（message 为空表示无警告）。
+    /// </summary>
+    private bool ValidateSucceededSet(
+        IEnumerable<SucceededPlacementRecord> records,
+        out string message)
+    {
+        var occupied = new List<PlacedBox>();
+        var definitionsByTypeId = GetBoxTypeDefinitions()
+            .ToDictionary(item => item.TypeId, item => item, StringComparer.Ordinal);
+        var orders = new HashSet<int>();
+        var warnings = new List<string>();
+        foreach (var item in records
+                     .OrderBy(x => x.Placement.Order)
+                     .ThenBy(x => x.BoxNumber, StringComparer.Ordinal))
+        {
+            if (!orders.Add(item.Placement.Order))
+            {
+                message = $"成功堆垛数据中存在重复 Order：{item.Placement.Order}。";
+                return false;
+            }
+
+            var box = new Box
+            {
+                BoxNumber = item.BoxNumber,
+                LengthMm = item.LengthMm,
+                WidthMm = item.WidthMm,
+                HeightMm = item.HeightMm,
+                WeightKg = item.WeightKg,
+                Status = BoxStatus.StackingSucceeded,
+                Order = item.Placement.Order,
+            };
+            var collisionBox = ToCollisionSizedBox(box, definitionsByTypeId);
+            var placed = ToPlacedBox(collisionBox, item.Placement, real: true);
+            if (!InsidePallet(placed))
+                warnings.Add($"箱子 {item.BoxNumber} 的成功落点超出托盘范围");
+
+            if (Collides(placed, occupied))
+                warnings.Add($"箱子 {item.BoxNumber} 的成功落点与已有成功占位间距不足或碰撞");
+
+            occupied.Add(placed);
+        }
+
+        message = warnings.Count == 0 ? string.Empty : "警告：" + string.Join("；", warnings) + "。";
+        return true;
+    }
+
     /// <summary>校验箱号、尺寸和重量，阻止无效几何进入规划器。</summary>
     private static void ValidateBox(Box box)
     {
@@ -2642,6 +4124,10 @@ public sealed class StackPlanner
 
     /// <summary>已堆垛成功箱子的固定位置和尺寸快照。</summary>
     private sealed record FixedPlacement(BoxPlacement Placement, double Length, double Width, double Height);
+    /// <summary>继续规划使用的成功堆垛基线。</summary>
+    private sealed record SucceededBaselineState(IReadOnlyList<Box> Boxes, IReadOnlyList<BoxPlacement> Placements);
+    /// <summary>成功层补齐计划：补齐数量与后续需要剔除的候选尺寸。</summary>
+    private sealed record SucceededLayerFillPlan(string TypeId, BoxDimension Dimension, int NeededCount);
 
     /// <summary>
     /// 规划器内部的三维占用。IsReal 表示真实成功占用，CanSupport 表示其顶部能否支撑后续箱子。

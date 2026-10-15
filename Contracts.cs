@@ -19,6 +19,49 @@ public enum BoxStatus
     StackingFailed,
 }
 
+/// <summary>Core 日志级别，按 Debug/Info/Warning/Error 递增。</summary>
+public enum PlannerLogLevel
+{
+    /// <summary>仅用于诊断的细粒度日志。</summary>
+    Debug,
+    /// <summary>关键流程的正常信息。</summary>
+    Info,
+    /// <summary>可恢复但需要关注的异常分支。</summary>
+    Warning,
+    /// <summary>流程失败或抛出异常。</summary>
+    Error,
+}
+
+/// <summary>Core 日志配置。</summary>
+public sealed class PlannerLogOptions
+{
+    /// <summary>是否启用日志。默认启用。</summary>
+    public bool Enabled { get; init; } = true;
+    /// <summary>输出阈值，小于该级别的日志会被丢弃。</summary>
+    public PlannerLogLevel MinLevel { get; init; } = PlannerLogLevel.Info;
+    /// <summary>内存缓冲区最多保留的日志条数。</summary>
+    public int MaxBufferedEntries { get; init; } = 1000;
+    /// <summary>可选日志文件路径；为空时只保留内存日志。</summary>
+    public string? FilePath { get; init; }
+}
+
+/// <summary>单条 Core 日志记录。</summary>
+public sealed class PlannerLogEntry
+{
+    /// <summary>日志生成时间（UTC）。</summary>
+    public required DateTimeOffset TimestampUtc { get; init; }
+    /// <summary>日志级别。</summary>
+    public required PlannerLogLevel Level { get; init; }
+    /// <summary>事件名称，便于调用方筛选统计。</summary>
+    public required string EventName { get; init; }
+    /// <summary>简要说明。</summary>
+    public required string Message { get; init; }
+    /// <summary>可选明细。</summary>
+    public string Detail { get; init; } = string.Empty;
+    /// <summary>可选关联箱号。</summary>
+    public string BoxNumber { get; init; } = string.Empty;
+}
+
 /// <summary>
 /// 独立箱子的输入属性和由 DLL 维护的业务规划状态。
 /// 每个实例代表一个真实箱子，不与其他箱子合并数量。
@@ -298,6 +341,42 @@ public sealed class InventoryUpsertResult
     public required int Invalid { get; init; }
     /// <summary>库存中当前有效总数。</summary>
     public required int Total { get; init; }
+    /// <summary>操作说明。</summary>
+    public required string Message { get; init; }
+}
+
+/// <summary>
+/// 已成功堆垛箱子的批量写入记录。
+/// </summary>
+public sealed class SucceededPlacementRecord
+{
+    /// <summary>箱子的唯一业务编号。</summary>
+    public required string BoxNumber { get; init; }
+    /// <summary>箱子长度，单位为 mm。</summary>
+    public required double LengthMm { get; init; }
+    /// <summary>箱子宽度，单位为 mm。</summary>
+    public required double WidthMm { get; init; }
+    /// <summary>箱子高度，单位为 mm。</summary>
+    public required double HeightMm { get; init; }
+    /// <summary>箱子重量，单位为 kg。</summary>
+    public required double WeightKg { get; init; }
+    /// <summary>箱子的成功堆垛落点。</summary>
+    public required BoxPlacement Placement { get; init; }
+}
+
+/// <summary>成功堆垛数据写入结果。</summary>
+public sealed class SucceededPlacementUpsertResult
+{
+    /// <summary>本次成功写入（新增+更新）的数量。</summary>
+    public required int Upserted { get; init; }
+    /// <summary>本次新增数量。</summary>
+    public required int Inserted { get; init; }
+    /// <summary>本次更新数量。</summary>
+    public required int Updated { get; init; }
+    /// <summary>本次无效记录数量。</summary>
+    public required int Invalid { get; init; }
+    /// <summary>当前成功堆垛箱子总数。</summary>
+    public required int TotalSucceeded { get; init; }
     /// <summary>操作说明。</summary>
     public required string Message { get; init; }
 }
