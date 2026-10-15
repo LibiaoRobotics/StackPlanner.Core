@@ -42,12 +42,14 @@ public sealed class StackPlanner
     private readonly Dictionary<string, FixedPlacement> _succeeded = new(StringComparer.Ordinal);
     /// <summary>最近一次完整规划，用于恢复非 OnShelf 箱子的规划占用。</summary>
     private readonly Dictionary<string, BoxPlacement> _lastPlacements = new(StringComparer.Ordinal);
-    /// <summary>已删除但等待同规格箱子补位的次数，仅供利用率规划使用。</summary>
+    /// <summary>已删除但等待同 TypeId 箱子补位的次数，仅供利用率规划使用。</summary>
     private readonly Dictionary<string, int> _pendingReplacementCounts = new(StringComparer.Ordinal);
-    /// <summary>匹配删除记录、等待在利用率规划中追加到同规格末尾的新箱号。</summary>
+    /// <summary>匹配删除记录、等待在利用率规划中追加到同 TypeId 末尾的新箱号。</summary>
     private readonly Dictionary<string, HashSet<string>> _pendingReplacementBoxes = new(StringComparer.Ordinal);
-    /// <summary>删除后保留的、可供同规格新箱复用的规划位置。</summary>
+    /// <summary>删除后保留的、可供同 TypeId 新箱复用的规划位置。</summary>
     private readonly Dictionary<string, List<BoxPlacement>> _reusableUtilizationPlacements = new(StringComparer.Ordinal);
+    /// <summary>记录可复用位置所属 TypeId 的尺寸，用于对外输出兼容维度信息。</summary>
+    private readonly Dictionary<string, BoxDimension> _reusablePlacementTypeDimensions = new(StringComparer.Ordinal);
     /// <summary>待堆垛库存数据库（与当前规划箱集合解耦）。</summary>
     private readonly InventoryDatabase _inventoryDatabase = new();
     /// <summary>对外返回的最近一次规划结果。</summary>
@@ -264,6 +266,7 @@ public sealed class StackPlanner
         _pendingReplacementCounts.Clear();
         _pendingReplacementBoxes.Clear();
         _reusableUtilizationPlacements.Clear();
+        _reusablePlacementTypeDimensions.Clear();
 
         foreach (var placement in placements)
             _lastPlacements[placement.BoxNumber] = placement;
@@ -276,16 +279,19 @@ public sealed class StackPlanner
         }
         foreach (var reusableSet in snapshot.ReusablePlacements)
         {
-            string key = BoxTypeKey(new Box
-            {
-                BoxNumber = "snapshot-dimension",
-                LengthMm = reusableSet.Dimension.LengthMm,
-                WidthMm = reusableSet.Dimension.WidthMm,
-                HeightMm = reusableSet.Dimension.HeightMm,
-            });
+            string key = SameSpecTypeId(
+                reusableSet.Dimension.LengthMm,
+                reusableSet.Dimension.WidthMm,
+                reusableSet.Dimension.HeightMm);
             _reusableUtilizationPlacements[key] = reusableSet.Placements
                 .Select(ClonePlacement)
                 .ToList();
+            _reusablePlacementTypeDimensions[key] = new BoxDimension
+            {
+                LengthMm = reusableSet.Dimension.LengthMm,
+                WidthMm = reusableSet.Dimension.WidthMm,
+                HeightMm = reusableSet.Dimension.HeightMm,
+            };
         }
 
         _lastPlan = new StackPlanResult
@@ -356,7 +362,7 @@ public sealed class StackPlanner
         if (box is null || box.Status is BoxStatus.StackingSucceeded or BoxStatus.Stacking)
             return false;
         int removedOrder = box.Order;
-        string typeKey = BoxTypeKey(box);
+        string typeKey = SameSpecTypeId(box);
         _group.MutableBoxes.Remove(box);
         foreach (var following in _group.MutableBoxes.Where(x => x.Order > removedOrder))
             following.Order--;
@@ -368,7 +374,7 @@ public sealed class StackPlanner
 
     /// <summary>
     /// 不重新规划地增加一个箱子。
-    /// 新箱子只能使用此前减箱释放的同尺寸规划位置；没有可复用位置时不会增加箱子。
+    /// 新箱子只能使用此前减箱释放的同 TypeId 规划位置；没有可复用位置时不会增加箱子。
     /// </summary>
     /// <param name="box">待增加的箱子，必须处于 OnShelf 状态。</param>
     /// <returns>增加结果，以及操作后的完整箱子集合和规划快照。</returns>
@@ -384,10 +390,10 @@ public sealed class StackPlanner
         if (!_lastPlan.PlanningResult || _lastPlacements.Count != _group.MutableBoxes.Count)
             return MutationFailure("当前没有完整有效的利用率规划，不能不重新规划地加箱。");
 
-        string key = BoxTypeKey(box);
+        string key = SameSpecTypeId(box);
         if (!_reusableUtilizationPlacements.TryGetValue(key, out var reusable)
             || reusable.Count == 0)
-            return MutationFailure($"尺寸 {key} 没有可复用的规划位置，不能不重新规划地加箱。");
+            return MutationFailure($"箱型 {key} 没有可复用的规划位置，不能不重新规划地加箱。");
 
         var added = CloneBox(box);
         var source = reusable.MinBy(point => point.Order)!;
@@ -414,7 +420,7 @@ public sealed class StackPlanner
 
     /// <summary>
     /// 不重新规划地删除一个箱子。
-    /// 删除后，同尺寸箱子依次使用前一个箱子的规划位置，并保留最后释放的位置供加箱复用。
+    /// 删除后，同 TypeId 箱子依次使用前一个箱子的规划位置，并保留最后释放的位置供加箱复用。
     /// </summary>
     /// <param name="box">待删除的箱子；仅使用其 BoxNumber 定位 Core 内部箱子。</param>
     /// <returns>删除结果，以及操作后的完整箱子集合和规划快照。</returns>
@@ -434,7 +440,7 @@ public sealed class StackPlanner
 
         var replacement = FindInventoryReplacementBox(removed);
         if (replacement is null)
-            return MutationSuccess("不重新规划地减箱完成。库存中未找到同尺寸可补箱子，已跳过自动补箱。");
+            return MutationSuccess("不重新规划地减箱完成。库存中未找到同 TypeId 可补箱子，已跳过自动补箱。");
 
         var addResult = AddBoxWithoutReplanning(replacement);
         if (!addResult.Succeeded)
@@ -445,7 +451,7 @@ public sealed class StackPlanner
 
     private Box? FindInventoryReplacementBox(Box removed)
     {
-        string removedKey = BoxTypeKey(removed);
+        string removedTypeId = SameSpecTypeId(removed);
         var excludedBoxNumbers = _group.MutableBoxes
             .Select(x => x.BoxNumber)
             .Append(removed.BoxNumber)
@@ -454,15 +460,7 @@ public sealed class StackPlanner
         var replacement = _inventoryDatabase
             .GetAll()
             .Where(record => !excludedBoxNumbers.Contains(record.BoxNumber))
-            .Where(record => string.Equals(
-                DimensionKey(new BoxDimension
-                {
-                    LengthMm = record.LengthMm,
-                    WidthMm = record.DepthMm,
-                    HeightMm = record.HeightMm,
-                }),
-                removedKey,
-                StringComparison.Ordinal))
+            .Where(record => string.Equals(SameSpecTypeId(record), removedTypeId, StringComparison.Ordinal))
             .OrderBy(record => record.BoxNumber, StringComparer.Ordinal)
             .FirstOrDefault();
 
@@ -1559,10 +1557,10 @@ public sealed class StackPlanner
         return copy;
     }
 
-    /// <summary>记录新增箱子是否匹配待补位的同规格删除箱。</summary>
+    /// <summary>记录新增箱子是否匹配待补位的同 TypeId 删除箱。</summary>
     private void RegisterReplacementBox(Box box)
     {
-        string typeKey = BoxTypeKey(box);
+        string typeKey = SameSpecTypeId(box);
         if (!_pendingReplacementCounts.TryGetValue(typeKey, out int pendingCount) || pendingCount <= 0)
             return;
 
@@ -1580,7 +1578,7 @@ public sealed class StackPlanner
     }
 
     /// <summary>
-    /// 仅为利用率规划应用同规格替换箱的末尾序号。
+    /// 仅为利用率规划应用同 TypeId 替换箱的末尾序号。
     /// 不修改 GeneratePlan 使用的增删箱子顺序逻辑。
     /// </summary>
     private void ApplyPendingUtilizationOrders()
@@ -1597,7 +1595,7 @@ public sealed class StackPlanner
 
             var eligible = _group.MutableBoxes
                 .Where(x => x.Status is not (BoxStatus.Stacking or BoxStatus.StackingSucceeded)
-                    && string.Equals(BoxTypeKey(x), typeKey, StringComparison.Ordinal)
+                    && string.Equals(SameSpecTypeId(x), typeKey, StringComparison.Ordinal)
                     && !entry.Value.Contains(x.BoxNumber)
                     && x.Order >= 0)
                 .ToArray();
@@ -1617,11 +1615,11 @@ public sealed class StackPlanner
     private void RemoveUtilizationBox(string boxNumber)
     {
         var removed = FindBox(boxNumber)!;
-        string removedKey = BoxTypeKey(removed);
+        string removedKey = SameSpecTypeId(removed);
         var oldPlacements = _lastPlan.Placements.ToArray();
         var groups = oldPlacements
             .Where(point => FindBox(point.BoxNumber) is not null)
-            .GroupBy(point => BoxTypeKey(FindBox(point.BoxNumber)!), StringComparer.Ordinal)
+            .GroupBy(point => SameSpecTypeId(FindBox(point.BoxNumber)!), StringComparer.Ordinal)
             .ToArray();
         var replacements = new Dictionary<string, BoxPlacement>(StringComparer.Ordinal);
 
@@ -1650,6 +1648,12 @@ public sealed class StackPlanner
                         .Add(tail);
                     if (!_reusableUtilizationPlacements.ContainsKey(removedKey))
                         _reusableUtilizationPlacements[removedKey] = new List<BoxPlacement> { tail };
+                    _reusablePlacementTypeDimensions[removedKey] = new BoxDimension
+                    {
+                        LengthMm = removed.LengthMm,
+                        WidthMm = removed.WidthMm,
+                        HeightMm = removed.HeightMm,
+                    };
                 }
             }
         }
@@ -1703,20 +1707,67 @@ public sealed class StackPlanner
             .Where(entry => entry.Value.Count > 0)
             .Select(entry => new ReusablePlacementSet
             {
-                Dimension = ParseDimensionKey(entry.Key),
+                Dimension = ResolveReusableDimensionByTypeId(entry.Key),
                 Placements = entry.Value.Select(ClonePlacement).ToArray(),
             })
             .ToArray();
 
-    private static BoxDimension ParseDimensionKey(string key)
+    private BoxDimension ResolveReusableDimensionByTypeId(string typeId)
     {
-        var values = key.Split('x');
+        var definition = BoxTypeClassifier.GetDefinitions()
+            .FirstOrDefault(item => string.Equals(item.TypeId, typeId, StringComparison.Ordinal));
+        if (definition is not null)
+        {
+            return new BoxDimension
+            {
+                LengthMm = definition.RepLengthMm,
+                WidthMm = definition.RepDepthMm,
+                HeightMm = definition.RepHeightMm,
+            };
+        }
+
+        if (_reusablePlacementTypeDimensions.TryGetValue(typeId, out var dimension))
+        {
+            return new BoxDimension
+            {
+                LengthMm = dimension.LengthMm,
+                WidthMm = dimension.WidthMm,
+                HeightMm = dimension.HeightMm,
+            };
+        }
+
+        if (TryParseDimensionKey(typeId, out var parsed))
+            return parsed;
+
         return new BoxDimension
         {
-            LengthMm = double.Parse(values[0], System.Globalization.CultureInfo.InvariantCulture),
-            WidthMm = double.Parse(values[1], System.Globalization.CultureInfo.InvariantCulture),
-            HeightMm = double.Parse(values[2], System.Globalization.CultureInfo.InvariantCulture),
+            LengthMm = 0,
+            WidthMm = 0,
+            HeightMm = 0,
         };
+    }
+
+    private static bool TryParseDimensionKey(string key, out BoxDimension dimension)
+    {
+        dimension = default!;
+        var values = key.Split('x');
+        if (values.Length != 3)
+            return false;
+
+        if (!double.TryParse(values[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var length)
+            || !double.TryParse(values[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var width)
+            || !double.TryParse(values[2], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var height))
+        {
+            return false;
+        }
+
+        dimension = new BoxDimension
+        {
+            LengthMm = length,
+            WidthMm = width,
+            HeightMm = height,
+        };
+        return true;
     }
 
     private void AssignOrders(bool preserveExistingOnShelf = false)
@@ -2418,6 +2469,16 @@ public sealed class StackPlanner
             .Select(x => x.Key)
             .FirstOrDefault();
     }
+
+    private static string SameSpecTypeId(Box box)
+        => SameSpecTypeId(box.LengthMm, box.WidthMm, box.HeightMm);
+
+    private static string SameSpecTypeId(InventoryBoxRecord box)
+        // 库存维度语义：Depth->规划Length，Length->规划Width，Height->规划Height。
+        => SameSpecTypeId(box.DepthMm, box.LengthMm, box.HeightMm);
+
+    private static string SameSpecTypeId(double lengthMm, double widthMm, double heightMm)
+        => BoxTypeClassifier.ClassifyPlanBoxTypeId(lengthMm, widthMm, heightMm);
 
     private static string BoxTypeKey(Box box)
     {
